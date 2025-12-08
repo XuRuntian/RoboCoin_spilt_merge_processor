@@ -7,9 +7,9 @@
 使用示例:
 # 拆分模式 - 按episode数量
 python split_merge_dataset.py split \
-   --input /mnt/nas/synnas/docker2/robocoin-datasets/ruantong_a2d_box_storage_e \
-   --output /mnt/nas/synnas/docker2/robocoin-datasets/ruantong_a2d_box_storage_e_fix \
-   --max_episodes 58 
+   --input /home/kemove/robotics-data-processor/corobot2train_format/data_process/Split_aloha_zip_up_the_document_bag \
+   --output /home/kemove/robotics-data-processor/corobot2train_format/data_process/CoRobot \
+   --max_episodes 5 
 
 # 拆分模式 - 按帧数
 python split_merge_dataset.py split \
@@ -115,15 +115,17 @@ def mode_merge(args: argparse.Namespace):
         episode_to_frame_index,
         folder_dimensions,
         folder_task_mapping,
+        folder_annotations_mapping,
         all_tasks,
+        all_annotations,
         all_stats_data,
         total_frames,
     ) = select_episodes(
         source_folders,
         max_entries=None,
         max_episodes=max_episodes,
-        start_entries=getattr(args, "start_entries", None),         # 修复：传入起始帧偏移
-        start_episodes=getattr(args, "start_episodes", None),      # 修复：传入起始 episode 偏移
+        start_entries=getattr(args, "start_entries", None),
+        start_episodes=getattr(args, "start_episodes", None),
     )
 
     write_meta_and_copy(
@@ -134,9 +136,11 @@ def mode_merge(args: argparse.Namespace):
         all_episodes_stats=all_episodes_stats,
         folder_dimensions=folder_dimensions,
         folder_task_mapping=folder_task_mapping,
+        folder_annotations_mapping=folder_annotations_mapping,
         episode_to_frame_index=episode_to_frame_index,
         all_stats_data=all_stats_data,
         all_tasks=all_tasks,
+        all_annotations=all_annotations,
         total_frames=total_frames,
         max_dim_cli=max_dim_cli,
         fps=fps,
@@ -162,7 +166,9 @@ def mode_split(args: argparse.Namespace):
         episode_to_frame_index,
         folder_dimensions,
         folder_task_mapping,
+        folder_annotations_mapping,
         all_tasks,
+        all_annotations,
         all_stats_data,
         total_frames,
     ) = select_episodes(
@@ -181,9 +187,11 @@ def mode_split(args: argparse.Namespace):
         all_episodes_stats=all_episodes_stats,
         folder_dimensions=folder_dimensions,
         folder_task_mapping=folder_task_mapping,
+        folder_annotations_mapping=folder_annotations_mapping,
         episode_to_frame_index=episode_to_frame_index,
         all_stats_data=all_stats_data,
         all_tasks=all_tasks,
+        all_annotations=all_annotations,
         total_frames=total_frames,
         max_dim_cli=max_dim_cli,
         fps=fps,

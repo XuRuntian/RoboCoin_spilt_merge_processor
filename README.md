@@ -1,12 +1,12 @@
-# LeRobot Split & Merge Processor
+# RoboCOIN Split & Merge Processor
 
 一个用于机器人数据集的拆分与合并的命令行工具集：
 - 拆分（split）：从单个数据集中选择前 N 帧或前 N 个 episode，生成一个子集
 - 合并（merge）：从多个源数据集中选择并合并为一个统一的数据集
 
 本项目结构：
-- `lerobot_dataset_lib.py`：函数库，提供选择、统计合并、视频与数据拷贝、维度与索引对齐等底层能力
-- `split_merge_dataset.py`：命令行入口，解析参数并调用 `lerobot_dataset_lib.py` 的函数
+- `RoboCOIN_dataset_lib.py`：函数库，提供选择、统计合并、视频与数据拷贝、维度与索引对齐等底层能力
+- `split_merge_dataset.py`：命令行入口，解析参数并调用 `RoboCOIN_dataset_lib.py` 的函数
 
 ## 安装与环境
 
@@ -46,6 +46,7 @@ python split_merge_dataset.py --help
 - 截断优先级：`max_entries`（帧数）优先于 `max_episodes`。
 - 维度处理：对 `observation.state` 与 `action` 进行零填充到 `max_dim` 并更新 `info.json` 的 `features.shape`；未设置时取所有源的最大维度。
 - 帧率处理：`fps` 未提供时从源数据集 `meta/info.json` 读取并写入输出数据集。
+- 注释处理：统一聚合与重映射；支持定义表 `subtask_annotations.jsonl`、`scene_annotations.jsonl`、`gripper_mode_annotation.jsonl`、`gripper_activity_annotation.jsonl`、`eef_direction_annotation.jsonl`、`eef_velocity_annotation.jsonl`、`eef_acc_mag_annotation.jsonl`。定义表按描述去重与重编号；逐帧注释列（如 `subtask_annotation`、`scene_annotation`、`gripper_mode_state/action`、`gripper_activity_state/action`、`eef_direction_state/action`、`eef_velocity_state/action`、`eef_acc_mag_state/action`）会按统一索引重映射；`episodes_stats.jsonl` 中相关字段的 `min/max/mean` 同步重写。
 
 ## 参数说明
 
@@ -137,8 +138,9 @@ python split_merge_dataset.py merge \
 - `meta/episodes.jsonl`：所选 episode 列表与重编号
 - `meta/episodes_stats.jsonl`：逐 episode 的统计（维度对齐）
 - `meta/tasks.jsonl`：仅保留实际使用的任务（task_index 过滤）
-- `meta/stats.json`：全局统计，合并并基于 episode 统计重算（均值/计数）
+- `meta/stats.json`：全局统计，合并并基于逐 episode 统计重算（均值/计数）
 - `meta/info.json`：汇总信息（总帧数、总 episode、splits、features.shape、fps、chunks_size、total_videos 等）
+- `annotations/`：统一的注释定义表（按描述去重重编号），包含：`subtask_annotations.jsonl`、`scene_annotations.jsonl`、`gripper_mode_annotation.jsonl`、`gripper_activity_annotation.jsonl`、`eef_direction_annotation.jsonl`、`eef_velocity_annotation.jsonl`、`eef_acc_mag_annotation.jsonl`
 - `videos/`：根据 `info.json` 的 `video_path` 模板拷贝的视频
 - `data/chunk-XXX/episode_YYYYYY.parquet`：按 chunk 分组的帧数据，维度与索引已对齐
 
@@ -153,6 +155,14 @@ python split_merge_dataset.py merge \
 │   ├── episodes_stats.jsonl
 │   ├── tasks.jsonl
 │   └── stats.json
+├── annotations/
+│   ├── subtask_annotations.jsonl
+│   ├── scene_annotations.jsonl
+│   ├── gripper_mode_annotation.jsonl
+│   ├── gripper_activity_annotation.jsonl
+│   ├── eef_direction_annotation.jsonl
+│   ├── eef_velocity_annotation.jsonl
+│   └── eef_acc_mag_annotation.jsonl
 ├── videos/
 │   └── chunk-000/
 │       └── {video_key}/episode_{episode_index:06d}.mp4
@@ -195,4 +205,5 @@ python split_merge_dataset.py merge \
 - 运行拷贝与统计时需要安装 `pandas` 与 Parquet 后端（`pyarrow` 或 `fastparquet`）。
 - 如果某源数据集 `meta/info.json` 中缺少 `video_path`，视频拷贝会跳过；请确认该键存在或在库中添加保护逻辑。
 - 保证不同源数据集的 `features` 定义一致，特别是视频键（`dtype == "video"`）、`chunks_size` 等，以避免拷贝路径问题。
+- 注释定义表按描述去重，因此输出条目数可能小于源文件行数（例如 `scene_annotations.jsonl` 由 500 行变为 64 个唯一值）；帧级注释不会丢失，Parquet 与 `episodes_stats.jsonl` 的相关索引已重映射到统一编号。如需保留原始索引或仅保留实际使用的定义，可在库中调整聚合策略。
 - 其它自动项：`tasks.jsonl`按实际使用过滤；`splits`自动设置为`train: 0:total_episodes`；`chunks_size`从源 `info.json`继承。

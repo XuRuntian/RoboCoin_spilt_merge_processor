@@ -179,9 +179,24 @@ def select_episodes(
     episode_to_frame_index = {}
     folder_dimensions = {}
     folder_task_mapping = {}
+    folder_annotations_mapping = {}
     all_stats_data = []
     task_desc_to_new_index = {}
     all_unique_tasks = []
+    subtask_desc_to_new_index = {}
+    scene_desc_to_new_index = {}
+    gripper_mode_desc_to_new_index = {}
+    gripper_activity_desc_to_new_index = {}
+    eef_direction_desc_to_new_index = {}
+    eef_velocity_desc_to_new_index = {}
+    eef_acc_mag_desc_to_new_index = {}
+    all_subtasks = []
+    all_scenes = []
+    all_gripper_modes = []
+    all_gripper_activities = []
+    all_eef_direction = []
+    all_eef_velocity = []
+    all_eef_acc_mag = []
     total_frames = 0
     selected_total_episodes = 0
     skipped_frames = 0
@@ -196,7 +211,6 @@ def select_episodes(
         folder_dimensions[folder] = detect_folder_dim(folder, default_max_dim)
 
     for folder in source_folders:
-        # 任务映射
         folder_task_mapping[folder] = {}
         tasks_path = os.path.join(folder, "meta", "tasks.jsonl")
         folder_tasks = load_jsonl(tasks_path) if os.path.exists(tasks_path) else []
@@ -208,6 +222,78 @@ def select_episodes(
                 task_desc_to_new_index[desc] = new_idx
                 all_unique_tasks.append({"task_index": new_idx, "task": desc})
             folder_task_mapping[folder][old_idx] = task_desc_to_new_index[desc]
+
+        folder_annotations_mapping[folder] = {"subtask_annotation": {}, "scene_annotation": {}, "gripper_mode": {}, "gripper_activity": {}, "eef_direction": {}, "eef_velocity": {}, "eef_acc_mag": {}}
+        subtask_path = os.path.join(folder, "annotations", "subtask_annotations.jsonl")
+        folder_subtasks = load_jsonl(subtask_path) if os.path.exists(subtask_path) else []
+        for item in folder_subtasks:
+            desc = item.get("subtask")
+            old_idx = item.get("subtask_index")
+            if desc not in subtask_desc_to_new_index:
+                new_idx = len(all_subtasks)
+                subtask_desc_to_new_index[desc] = new_idx
+                all_subtasks.append({"subtask_index": new_idx, "subtask": desc})
+            folder_annotations_mapping[folder]["subtask_annotation"][old_idx] = subtask_desc_to_new_index[desc]
+        scene_path = os.path.join(folder, "annotations", "scene_annotations.jsonl")
+        folder_scenes = load_jsonl(scene_path) if os.path.exists(scene_path) else []
+        for item in folder_scenes:
+            desc = item.get("scene")
+            old_idx = item.get("scene_index")
+            if desc not in scene_desc_to_new_index:
+                new_idx = len(all_scenes)
+                scene_desc_to_new_index[desc] = new_idx
+                all_scenes.append({"scene_index": new_idx, "scene": desc})
+            folder_annotations_mapping[folder]["scene_annotation"][old_idx] = scene_desc_to_new_index[desc]
+        gm_path = os.path.join(folder, "annotations", "gripper_mode_annotation.jsonl")
+        folder_gm = load_jsonl(gm_path) if os.path.exists(gm_path) else []
+        for item in folder_gm:
+            desc = item.get("gripper_mode")
+            old_idx = item.get("gripper_mode_index")
+            if desc not in gripper_mode_desc_to_new_index:
+                new_idx = len(all_gripper_modes)
+                gripper_mode_desc_to_new_index[desc] = new_idx
+                all_gripper_modes.append({"gripper_mode_index": new_idx, "gripper_mode": desc})
+            folder_annotations_mapping[folder]["gripper_mode"][old_idx] = gripper_mode_desc_to_new_index[desc]
+        ga_path = os.path.join(folder, "annotations", "gripper_activity_annotation.jsonl")
+        folder_ga = load_jsonl(ga_path) if os.path.exists(ga_path) else []
+        for item in folder_ga:
+            desc = item.get("gripper_activity")
+            old_idx = item.get("gripper_activity_index")
+            if desc not in gripper_activity_desc_to_new_index:
+                new_idx = len(all_gripper_activities)
+                gripper_activity_desc_to_new_index[desc] = new_idx
+                all_gripper_activities.append({"gripper_activity_index": new_idx, "gripper_activity": desc})
+            folder_annotations_mapping[folder]["gripper_activity"][old_idx] = gripper_activity_desc_to_new_index[desc]
+        ed_path = os.path.join(folder, "annotations", "eef_direction_annotation.jsonl")
+        folder_ed = load_jsonl(ed_path) if os.path.exists(ed_path) else []
+        for item in folder_ed:
+            desc = item.get("eef_direction")
+            old_idx = item.get("eef_direction_index")
+            if desc not in eef_direction_desc_to_new_index:
+                new_idx = len(all_eef_direction)
+                eef_direction_desc_to_new_index[desc] = new_idx
+                all_eef_direction.append({"eef_direction_index": new_idx, "eef_direction": desc})
+            folder_annotations_mapping[folder]["eef_direction"][old_idx] = eef_direction_desc_to_new_index[desc]
+        ev_path = os.path.join(folder, "annotations", "eef_velocity_annotation.jsonl")
+        folder_ev = load_jsonl(ev_path) if os.path.exists(ev_path) else []
+        for item in folder_ev:
+            desc = item.get("eef_velocity")
+            old_idx = item.get("eef_velocity_index")
+            if desc not in eef_velocity_desc_to_new_index:
+                new_idx = len(all_eef_velocity)
+                eef_velocity_desc_to_new_index[desc] = new_idx
+                all_eef_velocity.append({"eef_velocity_index": new_idx, "eef_velocity": desc})
+            folder_annotations_mapping[folder]["eef_velocity"][old_idx] = eef_velocity_desc_to_new_index[desc]
+        ea_path = os.path.join(folder, "annotations", "eef_acc_mag_annotation.jsonl")
+        folder_ea = load_jsonl(ea_path) if os.path.exists(ea_path) else []
+        for item in folder_ea:
+            desc = item.get("eef_acc_mag")
+            old_idx = item.get("eef_acc_mag_index")
+            if desc not in eef_acc_mag_desc_to_new_index:
+                new_idx = len(all_eef_acc_mag)
+                eef_acc_mag_desc_to_new_index[desc] = new_idx
+                all_eef_acc_mag.append({"eef_acc_mag_index": new_idx, "eef_acc_mag": desc})
+            folder_annotations_mapping[folder]["eef_acc_mag"][old_idx] = eef_acc_mag_desc_to_new_index[desc]
 
         episodes = load_jsonl(os.path.join(folder, "meta", "episodes.jsonl"))
         stats_path = os.path.join(folder, "meta", "episodes_stats.jsonl")
@@ -240,21 +326,33 @@ def select_episodes(
                 stats = stats_map[old_index]
                 stats["episode_index"] = new_index
 
-                # 将episode_stats的task_index从旧映射到新
-                if "stats" in stats and "task_index" in stats["stats"]:
-                    original_task_index = stats["stats"]["task_index"]
-                    if isinstance(original_task_index, dict) and "min" in original_task_index:
-                        old_task_idx = int(original_task_index["min"][0])
-                    else:
-                        old_task_idx = int(original_task_index)
-                    if folder in folder_task_mapping and old_task_idx in folder_task_mapping[folder]:
-                        new_task_idx = folder_task_mapping[folder][old_task_idx]
-                        if isinstance(stats["stats"]["task_index"], dict):
-                            stats["stats"]["task_index"]["min"] = [new_task_idx]
-                            stats["stats"]["task_index"]["max"] = [new_task_idx]
-                            stats["stats"]["task_index"]["mean"] = [float(new_task_idx)]
+                if "stats" in stats:
+                    if "task_index" in stats["stats"]:
+                        original_task_index = stats["stats"]["task_index"]
+                        if isinstance(original_task_index, dict) and "min" in original_task_index:
+                            old_task_idx = int(original_task_index["min"][0])
                         else:
-                            stats["stats"]["task_index"] = new_task_idx
+                            old_task_idx = int(original_task_index)
+                        if folder in folder_task_mapping and old_task_idx in folder_task_mapping[folder]:
+                            new_task_idx = folder_task_mapping[folder][old_task_idx]
+                            if isinstance(stats["stats"]["task_index"], dict):
+                                stats["stats"]["task_index"]["min"] = [new_task_idx]
+                                stats["stats"]["task_index"]["max"] = [new_task_idx]
+                                stats["stats"]["task_index"]["mean"] = [float(new_task_idx)]
+                            else:
+                                stats["stats"]["task_index"] = new_task_idx
+
+                    ann_map = folder_annotations_mapping.get(folder) if 'folder_annotations_mapping' in locals() else None
+                    if ann_map:
+                        def _map_vals(vals, key):
+                            if isinstance(vals, list):
+                                return [ann_map[key].get(int(v), int(v)) for v in vals]
+                            return vals
+                        for feat, key in [("subtask_annotation", "subtask_annotation"), ("scene_annotation", "scene_annotation"), ("gripper_mode_state", "gripper_mode"), ("gripper_mode_action", "gripper_mode"), ("gripper_activity_state", "gripper_activity"), ("gripper_activity_action", "gripper_activity"), ("eef_direction_state", "eef_direction"), ("eef_direction_action", "eef_direction"), ("eef_velocity_state", "eef_velocity"), ("eef_velocity_action", "eef_velocity"), ("eef_acc_mag_state", "eef_acc_mag"), ("eef_acc_mag_action", "eef_acc_mag")]:
+                            if feat in stats["stats"] and isinstance(stats["stats"][feat], dict):
+                                for k in ["min", "max", "mean"]:
+                                    if k in stats["stats"][feat]:
+                                        stats["stats"][feat][k] = _map_vals(stats["stats"][feat][k], key)
 
                 all_episodes_stats.append(stats)
                 if "stats" in stats:
@@ -266,6 +364,15 @@ def select_episodes(
             selected_total_episodes += 1
             episode_mapping.append((folder, old_index, new_index))
 
+    all_annotations = {
+        "subtask_annotations": all_subtasks,
+        "scene_annotations": all_scenes,
+        "gripper_mode_annotation": all_gripper_modes,
+        "gripper_activity_annotation": all_gripper_activities,
+        "eef_direction_annotation": all_eef_direction,
+        "eef_velocity_annotation": all_eef_velocity,
+        "eef_acc_mag_annotation": all_eef_acc_mag,
+    }
     return (
         episode_mapping,
         all_episodes,
@@ -273,7 +380,9 @@ def select_episodes(
         episode_to_frame_index,
         folder_dimensions,
         folder_task_mapping,
+        folder_annotations_mapping,
         all_unique_tasks,
+        all_annotations,
         all_stats_data,
         total_frames,
     )
@@ -287,9 +396,11 @@ def write_meta_and_copy(
     all_episodes_stats,
     folder_dimensions,
     folder_task_mapping,
+    folder_annotations_mapping,
     episode_to_frame_index,
     all_stats_data,
     all_tasks,
+    all_annotations,
     total_frames,
     max_dim_cli,
     fps,
@@ -331,6 +442,23 @@ def write_meta_and_copy(
     filtered_tasks = [t for t in all_tasks if t["task_index"] in used_task_indices]
     save_jsonl(filtered_tasks, os.path.join(output_folder, "meta", "tasks.jsonl"))
 
+    os.makedirs(os.path.join(output_folder, "annotations"), exist_ok=True)
+    if all_annotations:
+        if all_annotations.get("subtask_annotations"):
+            save_jsonl(all_annotations["subtask_annotations"], os.path.join(output_folder, "annotations", "subtask_annotations.jsonl"))
+        if all_annotations.get("scene_annotations"):
+            save_jsonl(all_annotations["scene_annotations"], os.path.join(output_folder, "annotations", "scene_annotations.jsonl"))
+        if all_annotations.get("gripper_mode_annotation"):
+            save_jsonl(all_annotations["gripper_mode_annotation"], os.path.join(output_folder, "annotations", "gripper_mode_annotation.jsonl"))
+        if all_annotations.get("gripper_activity_annotation"):
+            save_jsonl(all_annotations["gripper_activity_annotation"], os.path.join(output_folder, "annotations", "gripper_activity_annotation.jsonl"))
+        if all_annotations.get("eef_direction_annotation"):
+            save_jsonl(all_annotations["eef_direction_annotation"], os.path.join(output_folder, "annotations", "eef_direction_annotation.jsonl"))
+        if all_annotations.get("eef_velocity_annotation"):
+            save_jsonl(all_annotations["eef_velocity_annotation"], os.path.join(output_folder, "annotations", "eef_velocity_annotation.jsonl"))
+        if all_annotations.get("eef_acc_mag_annotation"):
+            save_jsonl(all_annotations["eef_acc_mag_annotation"], os.path.join(output_folder, "annotations", "eef_acc_mag_annotation.jsonl"))
+
     # 合并并保存 stats.json
     stats_list = []
     for folder in source_folders:
@@ -370,6 +498,7 @@ def write_meta_and_copy(
         fps=fps,
         episode_to_frame_index=episode_to_frame_index,
         folder_task_mapping=folder_task_mapping,
+        folder_annotations_mapping=folder_annotations_mapping,
         chunks_size=chunks_size,
     )
     print(f"Done: {total_episodes} episodes, {total_frames} frames, output={output_folder}")
@@ -838,6 +967,7 @@ def copy_data_files(
     fps=None,
     episode_to_frame_index=None,
     folder_task_mapping=None,
+    folder_annotations_mapping=None,
     chunks_size=1000,
     default_fps=20,
 ):
@@ -952,10 +1082,7 @@ def copy_data_files(
 
                 # 更新task_index列 (Update task_index column)
                 if "task_index" in df.columns and folder_task_mapping and old_folder in folder_task_mapping:
-                    # 获取当前task_index (Get current task_index)
                     current_task_index = df["task_index"].iloc[0]
-
-                    # 检查是否有对应的新索引 (Check if there's a corresponding new index)
                     if current_task_index in folder_task_mapping[old_folder]:
                         new_task_index = folder_task_mapping[old_folder][current_task_index]
                         print(
@@ -966,6 +1093,42 @@ def copy_data_files(
                         print(
                             f"警告: 找不到task_index {current_task_index}的映射关系 (Warning: No mapping found for task_index {current_task_index})"
                         )
+
+                if folder_annotations_mapping and old_folder in folder_annotations_mapping:
+                    ann_map = folder_annotations_mapping[old_folder]
+                    if "subtask_annotation" in df.columns and "subtask_annotation" in ann_map:
+                        df["subtask_annotation"] = df["subtask_annotation"].apply(
+                            lambda x: [ann_map["subtask_annotation"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
+                        )
+                    if "scene_annotation" in df.columns and "scene_annotation" in ann_map:
+                        df["scene_annotation"] = df["scene_annotation"].apply(
+                            lambda x: [ann_map["scene_annotation"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
+                        )
+                    for col in ["gripper_mode_state", "gripper_mode_action"]:
+                        if col in df.columns and "gripper_mode" in ann_map:
+                            df[col] = df[col].apply(
+                                lambda x: [ann_map["gripper_mode"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
+                            )
+                    for col in ["gripper_activity_state", "gripper_activity_action"]:
+                        if col in df.columns and "gripper_activity" in ann_map:
+                            df[col] = df[col].apply(
+                                lambda x: [ann_map["gripper_activity"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
+                            )
+                    for col in ["eef_direction_state", "eef_direction_action"]:
+                        if col in df.columns and "eef_direction" in ann_map:
+                            df[col] = df[col].apply(
+                                lambda x: [ann_map["eef_direction"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
+                            )
+                    for col in ["eef_velocity_state", "eef_velocity_action"]:
+                        if col in df.columns and "eef_velocity" in ann_map:
+                            df[col] = df[col].apply(
+                                lambda x: [ann_map["eef_velocity"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
+                            )
+                    for col in ["eef_acc_mag_state", "eef_acc_mag_action"]:
+                        if col in df.columns and "eef_acc_mag" in ann_map:
+                            df[col] = df[col].apply(
+                                lambda x: [ann_map["eef_acc_mag"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
+                            )
 
                 # 计算chunk编号 (Calculate chunk number)
                 chunk_index = new_index // chunks_size
@@ -1056,10 +1219,7 @@ def copy_data_files(
                                 and folder_task_mapping
                                 and old_folder in folder_task_mapping
                             ):
-                                # 获取当前task_index (Get current task_index)
                                 current_task_index = df["task_index"].iloc[0]
-
-                                # 检查是否有对应的新索引 (Check if there's a corresponding new index)
                                 if current_task_index in folder_task_mapping[old_folder]:
                                     new_task_index = folder_task_mapping[old_folder][current_task_index]
                                     print(
@@ -1070,6 +1230,42 @@ def copy_data_files(
                                     print(
                                         f"警告: 找不到task_index {current_task_index}的映射关系 (Warning: No mapping found for task_index {current_task_index})"
                                     )
+
+                            if folder_annotations_mapping and old_folder in folder_annotations_mapping:
+                                ann_map = folder_annotations_mapping[old_folder]
+                                if "subtask_annotation" in df.columns and "subtask_annotation" in ann_map:
+                                    df["subtask_annotation"] = df["subtask_annotation"].apply(
+                                        lambda x: [ann_map["subtask_annotation"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
+                                    )
+                                if "scene_annotation" in df.columns and "scene_annotation" in ann_map:
+                                    df["scene_annotation"] = df["scene_annotation"].apply(
+                                        lambda x: [ann_map["scene_annotation"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
+                                    )
+                                for col in ["gripper_mode_state", "gripper_mode_action"]:
+                                    if col in df.columns and "gripper_mode" in ann_map:
+                                        df[col] = df[col].apply(
+                                            lambda x: [ann_map["gripper_mode"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
+                                        )
+                                for col in ["gripper_activity_state", "gripper_activity_action"]:
+                                    if col in df.columns and "gripper_activity" in ann_map:
+                                        df[col] = df[col].apply(
+                                            lambda x: [ann_map["gripper_activity"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
+                                        )
+                                for col in ["eef_direction_state", "eef_direction_action"]:
+                                    if col in df.columns and "eef_direction" in ann_map:
+                                        df[col] = df[col].apply(
+                                            lambda x: [ann_map["eef_direction"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
+                                        )
+                                for col in ["eef_velocity_state", "eef_velocity_action"]:
+                                    if col in df.columns and "eef_velocity" in ann_map:
+                                        df[col] = df[col].apply(
+                                            lambda x: [ann_map["eef_velocity"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
+                                        )
+                                for col in ["eef_acc_mag_state", "eef_acc_mag_action"]:
+                                    if col in df.columns and "eef_acc_mag" in ann_map:
+                                        df[col] = df[col].apply(
+                                            lambda x: [ann_map["eef_acc_mag"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
+                                        )
 
                             # 计算chunk编号 (Calculate chunk number)
                             chunk_index = new_index // chunks_size
