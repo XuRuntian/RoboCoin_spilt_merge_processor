@@ -7,8 +7,8 @@
 使用示例:
 # 拆分模式 - 按episode数量
 python split_merge_dataset.py split \
-   --input /home/kemove/robotics-data-processor/corobot2train_format/data_process/Split_aloha_zip_up_the_document_bag \
-   --output /home/kemove/robotics-data-processor/corobot2train_format/data_process/CoRobot \
+   --input /home/kemove/robotics-data-processor/corobot2train_format/data_process/Split_aloha_basket_storage_long_bread \
+   --output /home/kemove/robotics-data-processor/corobot2train_format/data_process/CoRobot_1 \
    --max_episodes 5 
 
 # 拆分模式 - 按帧数
@@ -72,7 +72,7 @@ import numpy as np
 import pandas as pd
 
 # 导入合并相关函数
-from lerobot_dataset_lib import (
+from RoboCOIN_dataset_lib import (
     load_jsonl,
     save_jsonl,
     copy_videos,
