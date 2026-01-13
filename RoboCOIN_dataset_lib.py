@@ -6,7 +6,46 @@ import traceback
 
 import numpy as np
 import pandas as pd
+import cv2
+# 全局保留字段列表
+SYSTEM_RESERVED_FIELDS = [
+    "episode_index", "frame_index", "timestamp", "index", "task_index", 
+    "subtask_annotation", "scene_annotation", 
+    "eef_direction_state", "eef_direction_action",
+    "eef_velocity_state", "eef_velocity_action",
+    "gripper_mode_state", "gripper_mode_action",
+    "gripper_activity_state", "gripper_activity_action"
+]
 
+def get_safe_indices(names_list):
+    """
+    根据列名列表，返回需要保留的索引列表。
+    逻辑：保留关节(joint/rad)和夹爪(gripper)，剔除末端(end_pos/end_quat/eef)。
+    """
+    if not names_list:
+        return []
+    
+    indices = []
+    kept_names = []
+    
+    for i, name in enumerate(names_list):
+        # 转换为小写比较
+        n = name.lower()
+        # === 过滤逻辑 ===
+        # 如果包含末端位姿关键词，则丢弃
+        if "end_pos" in n or "end_quat" in n or "eef_pose" in n or "robot_pos" in n or "robot_quat" in n:
+            continue
+            
+        # 或者：只保留 explicit 的关键词 (根据你的需求调整)
+        # if "joint" in n or "rad" in n or "gripper" in n:
+        #     indices.append(i)
+        #     kept_names.append(name)
+        
+        # 目前的逻辑：黑名单模式 (剔除明确不需要的，保留其他的)
+        indices.append(i)
+        kept_names.append(name)
+        
+    return indices, kept_names
 
 def load_jsonl(file_path):
     """
@@ -74,6 +113,57 @@ def save_jsonl(data, file_path):
 
 
 # ========= 新增：通用工具函数 =========
+
+import subprocess # 记得在文件顶部导入这个
+
+def process_video_pad(src_path, dst_path, target_w, target_h):
+    """
+    使用系统 FFmpeg 命令对视频进行缩放并填充黑边 (Letterbox)。
+    这比 OpenCV 更稳健，能解决 AV1 解码问题，且速度更快。
+    """
+    # 检查 src_path 是否存在
+    if not os.path.exists(src_path):
+        raise IOError(f"源视频文件不存在: {src_path}")
+
+    # 构建 FFmpeg 滤镜字符串
+    # 1. scale: 缩放视频，保持长宽比，使其适应目标框 (force_original_aspect_ratio=decrease)
+    # 2. pad: 在缩放后的视频周围填充黑边，使其达到目标分辨率，位置居中
+    # 3. setsar: 强制设置像素比为 1:1，防止播放器拉伸
+    vf_filter = (
+        f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+        f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,"
+        f"setsar=1"
+    )
+
+    # 构建完整的命令行
+    # -y: 覆盖输出文件
+    # -loglevel error: 减少日志输出，只显示错误
+    # -c:v libx264: 重新编码为 H.264 (兼容性最好)
+    # -pix_fmt yuv420p: 确保兼容所有播放器和训练框架
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-loglevel", "error",
+        "-i", src_path,
+        "-vf", vf_filter,
+        "-c:v", "libx264", 
+        "-pix_fmt", "yuv420p",
+        dst_path
+    ]
+
+    try:
+        # 执行命令
+        result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except subprocess.CalledProcessError as e:
+        # 如果 ffmpeg 报错，抛出异常，让外层捕获并处理
+        error_msg = e.stderr.strip() if e.stderr else "未知错误"
+        raise IOError(f"FFmpeg 处理失败: {error_msg}")
+    except FileNotFoundError:
+        raise IOError("未找到 ffmpeg 命令。请先安装: apt-get install ffmpeg")
+
+    # 简单的后置检查
+    if not os.path.exists(dst_path) or os.path.getsize(dst_path) == 0:
+        raise IOError(f"FFmpeg 未能生成有效的视频文件: {dst_path}")
 
 def get_info(path):
     info_path = os.path.join(path, "meta", "info.json")
@@ -404,18 +494,68 @@ def write_meta_and_copy(
     total_frames,
     max_dim_cli,
     fps,
+    features_to_keep=None,  # 新增参数
+    video_size=None, # 新增参数
+    remove_eef=False
 ):
     os.makedirs(output_folder, exist_ok=True)
     os.makedirs(os.path.join(output_folder, "meta"), exist_ok=True)
 
     base_info = get_info(source_folders[0])
+    original_max_dim = max_dim_cli or max(folder_dimensions.values())
+    new_shapes = {}
+    
+    if remove_eef:
+        for feat in ["observation.state", "action"]:
+            if feat in base_info["features"]:
+                names = base_info["features"][feat].get("names", [])
+                if names:
+                    _, kept_names = get_safe_indices(names)
+                    base_info["features"][feat]["names"] = kept_names
+                    # 更新 shape，例如从 [41] 变为 [16]
+                    new_dim = len(kept_names)
+                    base_info["features"][feat]["shape"] = [new_dim]
+                    new_shapes[feat] = new_dim
+                    print(f"[{feat}] 剔除EEF信息: 原维度 {len(names)} -> 新维度 {new_dim}")
+    if "observation.state" in new_shapes:
+        actual_max_dim = new_shapes["observation.state"]
+        print(f"!!! 全局维度已更新: {original_max_dim} -> {actual_max_dim} !!!")
+    elif max_dim_cli:
+        actual_max_dim = max_dim_cli
+    # === 修改逻辑开始：过滤 info.json 中的 features ===
+    RESERVED_FEATURES = SYSTEM_RESERVED_FIELDS
+    if features_to_keep:
+        print(f"筛选特定字段: {features_to_keep}")
+        # 保留必要的元数据键，但过滤 features
+        original_features = base_info.get("features", {})
+        filtered_features = {}
+        all_wanted = set(features_to_keep) | set(RESERVED_FEATURES)
+        for feat in all_wanted:
+            if feat in original_features:
+                feat_def = original_features[feat].copy() # 必须用 copy
+                
+                # === 关键修复：更新 info.json 里的分辨率数值 ===
+                if feat_def.get("dtype") == "video" and video_size is not None:
+                    tw, th = video_size
+                    feat_def["shape"] = [th, tw, 3] # 设置为新分辨率
+                    if "info" in feat_def:
+                        feat_def["info"] = feat_def["info"].copy()
+                        feat_def["info"]["video.width"] = tw
+                        feat_def["info"]["video.height"] = th
+
+                filtered_features[feat] = feat_def
+        base_info["features"] = filtered_features
+        
+        # 同时更新 video_keys，如果用户没选视频字段，就不应该复制视频
+        video_keys = [k for k in get_video_keys({"features": filtered_features})]
+    else:
+        video_keys = get_video_keys(base_info)
+    # === 修改逻辑结束 ===
     chunks_size = get_chunks_size(base_info)
-    video_keys = get_video_keys(base_info)
 
     total_episodes = len(all_episodes)
     total_videos = len(video_keys) * total_episodes
 
-    actual_max_dim = max_dim_cli or max(folder_dimensions.values())
 
     # 对齐并保存 episodes_stats
     aligned_episode_stats = []
@@ -469,6 +609,8 @@ def write_meta_and_copy(
     if stats_list:
         merged_stats = merge_stats(stats_list)
         recalc_merged_stats_with_episode_stats(merged_stats, all_stats_data, target_dim=actual_max_dim)
+        if features_to_keep:
+            merged_stats = {k: v for k, v in merged_stats.items() if k in features_to_keep}
         with open(os.path.join(output_folder, "meta", "stats.json"), "w") as f:
             json.dump(merged_stats, f, indent=4)
 
@@ -489,7 +631,8 @@ def write_meta_and_copy(
         json.dump(base_info, f, indent=4)
 
     # 复制视频和数据文件
-    copy_videos(source_folders, output_folder, episode_mapping)
+    if video_keys:
+        copy_videos(source_folders, output_folder, episode_mapping, video_size=video_size, filtered_features=base_info["features"])
     copy_data_files(
         source_folders=source_folders,
         output_folder=output_folder,
@@ -500,6 +643,8 @@ def write_meta_and_copy(
         folder_task_mapping=folder_task_mapping,
         folder_annotations_mapping=folder_annotations_mapping,
         chunks_size=chunks_size,
+        features_to_keep=features_to_keep,
+        remove_eef_flag=remove_eef,
     )
     print(f"Done: {total_episodes} episodes, {total_frames} frames, output={output_folder}")
 
@@ -767,16 +912,10 @@ def merge_stats(stats_list):
     return merged_stats
 
 
-def copy_videos(source_folders, output_folder, episode_mapping):
+def copy_videos(source_folders, output_folder, episode_mapping, video_size=None, filtered_features=None):
     """
     从源文件夹复制视频文件到输出文件夹，保持正确的索引和结构
     (Copy video files from source folders to output folder, maintaining correct indices and structure)
-
-    Args:
-        source_folders (list): 源数据集文件夹路径列表 (List of source dataset folder paths)
-        output_folder (str): 输出文件夹路径 (Output folder path)
-        episode_mapping (list): 包含(旧文件夹,旧索引,新索引)元组的列表
-                               (List of tuples containing (old_folder, old_index, new_index))
     """
     # Get info.json to determine video structure
     info_path = os.path.join(source_folders[0], "meta", "info.json")
@@ -784,16 +923,17 @@ def copy_videos(source_folders, output_folder, episode_mapping):
         info = json.load(f)
 
     video_path_template = info["video_path"]
-
-    # Identify video keys from the template
-    # Example: "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
+    
+    # === 决定扫描哪些 Video Key ===
+    # 如果传入了 filtered_features，只处理其中的 video 类型字段
+    features_to_scan = filtered_features if filtered_features is not None else info.get("features", {})
+    
     video_keys = []
-    for feature_name, feature_info in info["features"].items():
-        if feature_info.get("dtype") == "video":
-            # Use the full feature name as the video key
-            video_keys.append(feature_name)
-
-    print(f"Found video keys: {video_keys}")
+    for k, v in features_to_scan.items():
+        if v.get("dtype") == "video":
+            video_keys.append(k)
+    
+    print(f"即将复制的视频流: {video_keys}")
 
     # Copy videos for each episode
     for old_folder, old_index, new_index in episode_mapping:
@@ -820,6 +960,7 @@ def copy_videos(source_folders, output_folder, episode_mapping):
                 os.path.join(
                     old_folder, f"videos/chunk-{episode_chunk:03d}/{video_key}/episode_{old_index}.mp4"
                 ),
+                # Fallback for some datasets
                 os.path.join(old_folder, f"videos/chunk-000/{video_key}/episode_000000.mp4"),
             ]
 
@@ -842,43 +983,26 @@ def copy_videos(source_folders, output_folder, episode_mapping):
                 # Create destination directory if it doesn't exist
                 os.makedirs(os.path.dirname(dest_video_path), exist_ok=True)
 
-                print(f"Copying video: {source_video_path} -> {dest_video_path}")
-                shutil.copy2(source_video_path, dest_video_path)
+                # === 处理逻辑 ===
+                if video_size is not None:
+                    target_w, target_h = video_size
+                    print(f"Processing video: {source_video_path} -> {dest_video_path}") 
+                    try:
+                        process_video_pad(source_video_path, dest_video_path, target_w, target_h)
+                    except Exception as e:
+                        print(f"Error processing video {source_video_path}: {e}")
+                        # 失败时回退到直接复制
+                        shutil.copy2(source_video_path, dest_video_path)
+                else:
+                    # 原有逻辑：直接复制
+                    # print(f"Copying video: {source_video_path} -> {dest_video_path}")
+                    shutil.copy2(source_video_path, dest_video_path)
             else:
-                # If no file is found, search the directory recursively
-                found = False
-                for root, _, files in os.walk(os.path.join(old_folder, "videos")):
-                    for file in files:
-                        if file.endswith(".mp4") and video_key in root:
-                            source_video_path = os.path.join(root, file)
-
-                            # Construct destination path
-                            dest_video_path = os.path.join(
-                                output_folder,
-                                video_path_template.format(
-                                    episode_chunk=new_episode_chunk,
-                                    video_key=video_key,
-                                    episode_index=new_index,
-                                ),
-                            )
-
-                            # Create destination directory if it doesn't exist
-                            os.makedirs(os.path.dirname(dest_video_path), exist_ok=True)
-
-                            print(
-                                f"Copying video (found by search): {source_video_path} -> {dest_video_path}"
-                            )
-                            shutil.copy2(source_video_path, dest_video_path)
-                            found = True
-                            break
-                    if found:
-                        break
-
-                if not found:
-                    print(
-                        f"Warning: Video file not found for {video_key}, episode {old_index} in {old_folder}"
-                    )
-
+                # === 修改点：删除了原来的递归搜索 (os.walk) ===
+                # 如果标准路径找不到，直接报警告，不进行模糊搜索
+                print(
+                    f"Warning: Video file not found for {video_key}, episode {old_index} in {old_folder}"
+                )
 
 def validate_timestamps(source_folders, tolerance_s=1e-4):
     """
@@ -970,6 +1094,8 @@ def copy_data_files(
     folder_annotations_mapping=None,
     chunks_size=1000,
     default_fps=20,
+    features_to_keep=None, # 新增参数
+    remove_eef_flag=False
 ):
     """
     复制并处理parquet数据文件，包括维度填充和索引更新
@@ -1013,6 +1139,24 @@ def copy_data_files(
     # 添加一个列表来记录失败的文件及原因
     # (Add a list to record failed files and reasons)
     failed_files = []
+    RESERVED_COLUMNS = SYSTEM_RESERVED_FIELDS
+    # === 辅助函数：统一的列过滤逻辑 ===
+    def _filter_columns(dataframe):
+        if features_to_keep:
+            cols_to_retain = set(features_to_keep)
+            final_columns = []
+            for col in dataframe.columns:
+                # 保留条件：用户指定 或 系统保留 或 指定字段的子属性
+                if (col in cols_to_retain or 
+                    col in RESERVED_COLUMNS or 
+                    any(col.startswith(f"{k}.") for k in cols_to_retain)):
+                    final_columns.append(col)
+            
+            if final_columns:
+                return dataframe[final_columns]
+        return dataframe
+    # ===================================
+    folder_meta_cache = {}
 
     for i, (old_folder, old_index, new_index) in enumerate(episode_mapping):
         # 尝试找到源parquet文件 (Try to find source parquet file)
@@ -1031,8 +1175,49 @@ def copy_data_files(
         if source_path:
             try:
                 # 读取parquet文件 (Read parquet file)
-                df = pd.read_parquet(source_path)
-
+                # 读取
+                df = pd.read_parquet(source_path) 
+                # 过滤列
+                df = _filter_columns(df)
+                # === 修改点2：更新过滤逻辑 ===
+                # 剔除
+                if remove_eef_flag:
+                    if old_folder not in folder_meta_cache:
+                        src_info = get_info(old_folder)
+                        folder_meta_cache[old_folder] = src_info["features"]
+                    src_features = folder_meta_cache[old_folder]
+                    for feat in ["observation.state", "action"]:
+                        if feat in df.columns and feat in src_features:
+                            # 获取该数据集原始的 names
+                            original_names = src_features[feat].get("names", [])
+                            if original_names:
+                                # 计算需要保留的索引
+                                keep_idxs, _ = get_safe_indices(original_names)
+                                
+                                # 执行 numpy 切片：只保留 indices 对应的数据
+                                # 假设数据是 list 或 np.ndarray
+                                df[feat] = df[feat].apply(
+                                    lambda x: np.array(x)[keep_idxs].tolist() 
+                                    if isinstance(x, (list, np.ndarray)) and len(x) >= len(original_names) # 暂时大于等于，因为数据有问题
+                                    else x
+                                )
+                if features_to_keep:
+                    cols_to_retain = set(features_to_keep)
+                    final_columns = []
+                    
+                    for col in df.columns:
+                        # 保留条件：
+                        # 1. 是用户指定的 (如 observation.state)
+                        # 2. 是强制保留字段 (如 timestamp)
+                        # 3. 是用户指定字段的子属性 (如 observation.images.cam_high.path)
+                        if (col in cols_to_retain or 
+                            col in RESERVED_COLUMNS or 
+                            any(col.startswith(f"{k}.") for k in cols_to_retain)):
+                            final_columns.append(col)
+                    
+                    # 只有当筛选结果不为空时才覆盖，防止误删所有
+                    if final_columns:
+                        df = df[final_columns]
                 # 检查是否需要填充维度 (Check if dimensions need padding)
                 for feature in ["observation.state", "action"]:
                     if feature in df.columns:
@@ -1163,8 +1348,49 @@ def copy_data_files(
 
                             # 读取parquet文件 (Read parquet file)
                             df = pd.read_parquet(source_path)
+                            df = _filter_columns(df)
 
+                            if remove_eef_flag:
+                                if old_folder not in folder_meta_cache:
+                                    src_info = get_info(old_folder)
+                                    folder_meta_cache[old_folder] = src_info["features"]
+                                src_features = folder_meta_cache[old_folder]
+                                for feat in ["observation.state", "action"]:
+                                    if feat in df.columns and feat in src_features:
+                                        # 获取该数据集原始的 names
+                                        original_names = src_features[feat].get("names", [])
+                                        if original_names:
+                                            # 计算需要保留的索引
+                                            keep_idxs, _ = get_safe_indices(original_names)
+                                            
+                                            # 执行 numpy 切片：只保留 indices 对应的数据
+                                            # 假设数据是 list 或 np.ndarray
+                                            df[feat] = df[feat].apply(
+                                                lambda x: np.array(x)[keep_idxs].tolist() 
+                                                if isinstance(x, (list, np.ndarray)) and len(x) >= len(original_names)  # 暂时大于等于，因为数据有问题 shape 与 names 数量没对上
+                                                else x
+                                            )
+
+                            if features_to_keep:
+                                cols_to_retain = set(features_to_keep)
+                                final_columns = []
+                                
+                                for col in df.columns:
+                                    # 保留条件：
+                                    # 1. 是用户指定的 (如 observation.state)
+                                    # 2. 是强制保留字段 (如 timestamp)
+                                    # 3. 是用户指定字段的子属性 (如 observation.images.cam_high.path)
+                                    if (col in cols_to_retain or 
+                                        col in RESERVED_COLUMNS or 
+                                        any(col.startswith(f"{k}.") for k in cols_to_retain)):
+                                        final_columns.append(col)
+                                
+                                # 只有当筛选结果不为空时才覆盖，防止误删所有
+                                if final_columns:
+                                    df = df[final_columns]                            
+                            # === 修改点2：更新过滤逻辑 ===
                             # 检查是否需要填充维度 (Check if dimensions need padding)
+ 
                             for feature in ["observation.state", "action"]:
                                 if feature in df.columns:
                                     # 检查第一个非空值 (Check first non-null value)

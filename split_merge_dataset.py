@@ -87,6 +87,7 @@ def mode_merge(args: argparse.Namespace):
     """合并模式：将多个数据集合并为一个（CLI 调用库函数）。"""
     source_folders = list(args.sources) if getattr(args, "sources", None) else []
     src_dir = getattr(args, "sources_dir", None)
+    print(f"接收到{args}")
     if src_dir:
         for name in os.listdir(src_dir):
             p = os.path.join(src_dir, name)
@@ -105,9 +106,10 @@ def mode_merge(args: argparse.Namespace):
     fps = args.fps if args.fps is not None else get_info(source_folders[0]).get("fps", 20)
     max_episodes = args.max_episodes
     max_dim_cli = args.max_dim
+    features_to_keep = args.features  
     start_entries = getattr(args, "start_entries", None)
     start_episodes = getattr(args, "start_episodes", None)
-
+    
     (
         episode_mapping,
         all_episodes,
@@ -127,7 +129,9 @@ def mode_merge(args: argparse.Namespace):
         start_entries=getattr(args, "start_entries", None),
         start_episodes=getattr(args, "start_episodes", None),
     )
-
+    video_size = None
+    if args.video_width and args.video_height:
+        video_size = (args.video_width, args.video_height)
     write_meta_and_copy(
         source_folders=source_folders,
         output_folder=args.output,
@@ -144,6 +148,9 @@ def mode_merge(args: argparse.Namespace):
         total_frames=total_frames,
         max_dim_cli=max_dim_cli,
         fps=fps,
+        features_to_keep=features_to_keep,
+        video_size = video_size,
+        remove_eef=True,
     )
 
 
@@ -178,7 +185,9 @@ def mode_split(args: argparse.Namespace):
         start_entries=start_entries,
         start_episodes=start_episodes,
     )
-
+    video_size = None
+    if args.video_width and args.video_height:
+        video_size = (args.video_width, args.video_height)
     write_meta_and_copy(
         source_folders=source_folders,
         output_folder=args.output,
@@ -199,6 +208,9 @@ def mode_split(args: argparse.Namespace):
 
 
 def main():
+    def add_video_args(p):
+        p.add_argument("--video_width", type=int, help="目标视频宽度 (例如 1280)")
+        p.add_argument("--video_height", type=int, help="目标视频高度 (例如 720)")
     parser = argparse.ArgumentParser(description="数据集拆分与合并 CLI")
     subparsers = parser.add_subparsers(dest="mode", help="操作模式")
 
@@ -212,7 +224,7 @@ def main():
     split_parser.add_argument("--max_dim", type=int, help="最大维度设置")
     split_parser.add_argument("--start_entries", type=int, help="起始帧偏移（跳过前N帧）")
     split_parser.add_argument("--start_episodes", type=int, help="起始episode偏移（跳过前N个episode）")
-
+    add_video_args(split_parser) # 新增
     # 合并模式
     merge_parser = subparsers.add_parser("merge", help="合并数据集")
     merge_parser.add_argument("--sources", nargs="+", required=False, help="源数据集路径列表")
@@ -223,7 +235,12 @@ def main():
     merge_parser.add_argument("--max_dim", type=int, help="最大维度设置")
     merge_parser.add_argument("--start_entries", type=int, help="起始帧偏移（跳过前N帧）")
     merge_parser.add_argument("--start_episodes", type=int, help="起始episode偏移（跳过前N个episode）")
-
+    merge_parser.add_argument(
+        "--features", 
+        nargs="+", 
+        help="指定需要保留的字段列表 (例如: observation.state action observation.images.cam_high)"
+    )
+    add_video_args(merge_parser) # 新增
     args = parser.parse_args()
     if args.mode == "split":
         mode_split(args)
