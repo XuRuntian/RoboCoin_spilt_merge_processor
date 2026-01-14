@@ -494,79 +494,182 @@ def write_meta_and_copy(
     total_frames,
     max_dim_cli,
     fps,
-    features_to_keep=None,  # 新增参数
-    video_size=None, # 新增参数
+    features_to_keep=None,
+    video_size=None,
     remove_eef=False
 ):
     os.makedirs(output_folder, exist_ok=True)
     os.makedirs(os.path.join(output_folder, "meta"), exist_ok=True)
 
+    # 1. 建立 Episode Index -> Source Folder 的映射
+    episode_source_map = {new_idx: folder for folder, _, new_idx in episode_mapping}
+
+    # 2. 预扫描所有文件夹：计算各自的切片索引，并寻找全局最大维度
+    folder_indices_map = {} 
+    # 用于记录每个特征在所有数据集中出现过的最大维度 (切片后)
+    global_max_dims_map = {} # {'observation.state': 14, 'action': 16}
+    # 记录哪个文件夹提供了这个最大维度，以便后续借用其 names
+    max_dim_source_folder = {} 
+
     base_info = get_info(source_folders[0])
-    original_max_dim = max_dim_cli or max(folder_dimensions.values())
-    new_shapes = {}
     
+    # 遍历所有源文件夹
+    for folder in source_folders:
+        current_info = get_info(folder)
+        current_indices = {}
+        
+        # 如果启用了 remove_eef，计算该文件夹特定的保留索引
+        if remove_eef:
+            for feat in ["observation.state", "action"]:
+                if feat in current_info.get("features", {}):
+                    names = current_info["features"][feat].get("names", [])
+                    # 计算索引
+                    indices = []
+                    kept_names = []
+                    if names:
+                        indices, kept_names = get_safe_indices(names)
+                    else:
+                        # 如果没有names，则假设保留所有（或根据shape）
+                        # 这里简单处理：如果没names，可能不需要切片，或者无法切片
+                        # 但为了安全，如果有shape，我们记录维度
+                        shape = current_info["features"][feat].get("shape", [0])
+                        indices = list(range(shape[0]))
+                        kept_names = [f"dim_{i}" for i in indices]
+
+                    current_indices[feat] = indices
+                    
+                    # 更新全局最大维度记录
+                    sliced_dim = len(indices)
+                    if feat not in global_max_dims_map or sliced_dim > global_max_dims_map[feat]:
+                        global_max_dims_map[feat] = sliced_dim
+                        max_dim_source_folder[feat] = folder
+
+        folder_indices_map[folder] = current_indices
+
+    # 3. 确定最终的全局统一维度 (actual_max_dim)
+    # 取 state 和 action 中较大的那个，或者是 CLI 指定的
+    detected_max_dim = 0
+    if global_max_dims_map:
+        detected_max_dim = max(global_max_dims_map.values())
+    
+    original_max_dim = max_dim_cli or max(folder_dimensions.values())
+    
+    if detected_max_dim > 0:
+        # 如果检测到了切片后的维度（通常会比原始的小，但也可能不同源不一致）
+        # 我们必须确保 actual_max_dim 足够容纳所有源的最大切片维度
+        if max_dim_cli:
+            actual_max_dim = max(max_dim_cli, detected_max_dim)
+        else:
+            actual_max_dim = detected_max_dim
+        print(f"!!! 全局维度对齐: 检测到最大切片维度 {detected_max_dim}, 最终设定为 {actual_max_dim} !!!")
+    else:
+        actual_max_dim = max_dim_cli or original_max_dim
+
+    # 4. 更新 info.json (使用提供最大维度的那个文件夹的 names，防止 names 长度与 shape 不匹配)
     if remove_eef:
         for feat in ["observation.state", "action"]:
-            if feat in base_info["features"]:
-                names = base_info["features"][feat].get("names", [])
-                if names:
-                    _, kept_names = get_safe_indices(names)
-                    base_info["features"][feat]["names"] = kept_names
-                    # 更新 shape，例如从 [41] 变为 [16]
-                    new_dim = len(kept_names)
-                    base_info["features"][feat]["shape"] = [new_dim]
-                    new_shapes[feat] = new_dim
-                    print(f"[{feat}] 剔除EEF信息: 原维度 {len(names)} -> 新维度 {new_dim}")
-    if "observation.state" in new_shapes:
-        actual_max_dim = new_shapes["observation.state"]
-        print(f"!!! 全局维度已更新: {original_max_dim} -> {actual_max_dim} !!!")
-    elif max_dim_cli:
-        actual_max_dim = max_dim_cli
-    # === 修改逻辑开始：过滤 info.json 中的 features ===
+            # 如果我们计算出了新的维度
+            if feat in global_max_dims_map:
+                # 更新 shape
+                if feat not in base_info["features"]:
+                    continue # 如果模板里没有这个特征，跳过
+
+                base_info["features"][feat]["shape"] = [actual_max_dim]
+                
+                # 尝试更新 names (从拥有最大维度的文件夹里拿)
+                src_folder = max_dim_source_folder.get(feat)
+                if src_folder:
+                    src_info = get_info(src_folder)
+                    src_names = src_info["features"][feat].get("names", [])
+                    if src_names:
+                        _, kept_names = get_safe_indices(src_names)
+                        # 如果 names 长度不足 actual_max_dim (例如 padded)，需要补齐
+                        if len(kept_names) < actual_max_dim:
+                            kept_names += [f"pad_{i}" for i in range(len(kept_names), actual_max_dim)]
+                        base_info["features"][feat]["names"] = kept_names
+
+    # 5. 过滤字段 (Features Filtering)
     RESERVED_FEATURES = SYSTEM_RESERVED_FIELDS
     if features_to_keep:
         print(f"筛选特定字段: {features_to_keep}")
-        # 保留必要的元数据键，但过滤 features
         original_features = base_info.get("features", {})
         filtered_features = {}
         all_wanted = set(features_to_keep) | set(RESERVED_FEATURES)
         for feat in all_wanted:
             if feat in original_features:
-                feat_def = original_features[feat].copy() # 必须用 copy
-                
-                # === 关键修复：更新 info.json 里的分辨率数值 ===
+                feat_def = original_features[feat].copy()
                 if feat_def.get("dtype") == "video" and video_size is not None:
                     tw, th = video_size
-                    feat_def["shape"] = [th, tw, 3] # 设置为新分辨率
+                    feat_def["shape"] = [th, tw, 3]
                     if "info" in feat_def:
                         feat_def["info"] = feat_def["info"].copy()
                         feat_def["info"]["video.width"] = tw
                         feat_def["info"]["video.height"] = th
-
                 filtered_features[feat] = feat_def
         base_info["features"] = filtered_features
-        
-        # 同时更新 video_keys，如果用户没选视频字段，就不应该复制视频
         video_keys = [k for k in get_video_keys({"features": filtered_features})]
     else:
         video_keys = get_video_keys(base_info)
-    # === 修改逻辑结束 ===
+    
     chunks_size = get_chunks_size(base_info)
-
     total_episodes = len(all_episodes)
     total_videos = len(video_keys) * total_episodes
 
-
-    # 对齐并保存 episodes_stats
+    # 6. 处理 episodes_stats (切片 + 填充)
     aligned_episode_stats = []
+    features_set = set(features_to_keep) if features_to_keep else None
+
     for stats in all_episodes_stats:
+        if "stats" in stats:
+            current_stats = stats["stats"]
+            ep_idx = stats.get("episode_index")
+            source_folder = episode_source_map.get(ep_idx)
+            current_folder_indices = folder_indices_map.get(source_folder, {})
+
+            new_stats_content = {}
+            for k, v in current_stats.items():
+                keep = False
+                if features_set is None:
+                    keep = True
+                elif k in features_set or k in RESERVED_FEATURES:
+                    keep = True
+                else:
+                    pass # 子属性检查略
+                
+                if keep:
+                    # 使用该 episode 对应源文件夹的索引进行切片
+                    if k in current_folder_indices:
+                        indices = current_folder_indices[k]
+                        sliced_v = {}
+                        for stat_key, stat_val in v.items():
+                            if stat_key in ["min", "max", "mean", "std"] and isinstance(stat_val, list):
+                                try:
+                                    arr = np.array(stat_val)
+                                    # 维度保护
+                                    if len(arr) > len(indices) or (arr.ndim > 0 and arr.shape[0] >= len(indices)):
+                                         sliced_v[stat_key] = arr[indices].tolist()
+                                    else:
+                                         sliced_v[stat_key] = stat_val
+                                except Exception:
+                                    sliced_v[stat_key] = stat_val
+                            else:
+                                sliced_v[stat_key] = stat_val
+                        new_stats_content[k] = sliced_v
+                    else:
+                        new_stats_content[k] = v
+            stats["stats"] = new_stats_content
+
+        # 核心：填充到统一的 actual_max_dim
+        # 此时 stats 已经是切片过的（例如 14维 或 16维）
+        # actual_max_dim 是全局最大（例如 16维）
+        # pad_episode_stats 会把 14维的填充 0 到 16维，16维的保持不变
         pad_episode_stats(stats, from_dim=actual_max_dim, to_dim=actual_max_dim)
         aligned_episode_stats.append(stats)
 
     save_jsonl(all_episodes, os.path.join(output_folder, "meta", "episodes.jsonl"))
     save_jsonl(aligned_episode_stats, os.path.join(output_folder, "meta", "episodes_stats.jsonl"))
 
-    # 过滤并保存 tasks（仅保留使用到的任务索引）
+    # 过滤 Tasks
     used_task_indices = set()
     for episode in all_episodes:
         if "task_index" in episode:
@@ -582,24 +685,14 @@ def write_meta_and_copy(
     filtered_tasks = [t for t in all_tasks if t["task_index"] in used_task_indices]
     save_jsonl(filtered_tasks, os.path.join(output_folder, "meta", "tasks.jsonl"))
 
+    # 保存 Annotations
     os.makedirs(os.path.join(output_folder, "annotations"), exist_ok=True)
     if all_annotations:
-        if all_annotations.get("subtask_annotations"):
-            save_jsonl(all_annotations["subtask_annotations"], os.path.join(output_folder, "annotations", "subtask_annotations.jsonl"))
-        if all_annotations.get("scene_annotations"):
-            save_jsonl(all_annotations["scene_annotations"], os.path.join(output_folder, "annotations", "scene_annotations.jsonl"))
-        if all_annotations.get("gripper_mode_annotation"):
-            save_jsonl(all_annotations["gripper_mode_annotation"], os.path.join(output_folder, "annotations", "gripper_mode_annotation.jsonl"))
-        if all_annotations.get("gripper_activity_annotation"):
-            save_jsonl(all_annotations["gripper_activity_annotation"], os.path.join(output_folder, "annotations", "gripper_activity_annotation.jsonl"))
-        if all_annotations.get("eef_direction_annotation"):
-            save_jsonl(all_annotations["eef_direction_annotation"], os.path.join(output_folder, "annotations", "eef_direction_annotation.jsonl"))
-        if all_annotations.get("eef_velocity_annotation"):
-            save_jsonl(all_annotations["eef_velocity_annotation"], os.path.join(output_folder, "annotations", "eef_velocity_annotation.jsonl"))
-        if all_annotations.get("eef_acc_mag_annotation"):
-            save_jsonl(all_annotations["eef_acc_mag_annotation"], os.path.join(output_folder, "annotations", "eef_acc_mag_annotation.jsonl"))
+        for key, val in all_annotations.items():
+            if val:
+                save_jsonl(val, os.path.join(output_folder, "annotations", f"{key}.jsonl"))
 
-    # 合并并保存 stats.json
+    # 合并 Stats
     stats_list = []
     for folder in source_folders:
         stats_path = os.path.join(folder, "meta", "stats.json")
@@ -608,36 +701,39 @@ def write_meta_and_copy(
                 stats_list.append(json.load(f))
     if stats_list:
         merged_stats = merge_stats(stats_list)
+        # 重新计算聚合统计，这里很重要，它会利用 actual_max_dim 进行统一
         recalc_merged_stats_with_episode_stats(merged_stats, all_stats_data, target_dim=actual_max_dim)
         if features_to_keep:
-            merged_stats = {k: v for k, v in merged_stats.items() if k in features_to_keep}
+            merged_stats = {k: v for k, v in merged_stats.items() if k in features_set or k in RESERVED_FEATURES}
         with open(os.path.join(output_folder, "meta", "stats.json"), "w") as f:
             json.dump(merged_stats, f, indent=4)
 
-    # 更新 info.json
+    # 更新 Info
     base_info["total_episodes"] = total_episodes
     base_info["total_frames"] = total_frames
     base_info["total_tasks"] = len(filtered_tasks)
     base_info["total_chunks"] = (total_episodes + chunks_size - 1) // chunks_size
     base_info["splits"] = {"train": f"0:{total_episodes}"}
     base_info["fps"] = fps
-
+    base_info["total_videos"] = total_videos
+    # 确保 info 里的 shape 是最终统一的维度
     for feature_name in ["observation.state", "action"]:
         if feature_name in base_info.get("features", {}) and "shape" in base_info["features"][feature_name]:
             base_info["features"][feature_name]["shape"] = [actual_max_dim]
-    base_info["total_videos"] = total_videos
 
     with open(os.path.join(output_folder, "meta", "info.json"), "w") as f:
         json.dump(base_info, f, indent=4)
 
-    # 复制视频和数据文件
+    # 复制视频和数据
     if video_keys:
         copy_videos(source_folders, output_folder, episode_mapping, video_size=video_size, filtered_features=base_info["features"])
+    
+    # 这里的 max_dim 必须传 actual_max_dim，确保 parquet 文件也填充到统一维度
     copy_data_files(
         source_folders=source_folders,
         output_folder=output_folder,
         episode_mapping=episode_mapping,
-        max_dim=actual_max_dim,
+        max_dim=actual_max_dim, 
         fps=fps,
         episode_to_frame_index=episode_to_frame_index,
         folder_task_mapping=folder_task_mapping,
