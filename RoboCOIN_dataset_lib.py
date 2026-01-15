@@ -741,6 +741,7 @@ def write_meta_and_copy(
         chunks_size=chunks_size,
         features_to_keep=features_to_keep,
         remove_eef_flag=remove_eef,
+        features_def=base_info["features"],
     )
     print(f"Done: {total_episodes} episodes, {total_frames} frames, output={output_folder}")
 
@@ -1179,6 +1180,9 @@ def validate_timestamps(source_folders, tolerance_s=1e-4):
     return issues, fps_values
 
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 def copy_data_files(
     source_folders,
     output_folder,
@@ -1190,93 +1194,123 @@ def copy_data_files(
     folder_annotations_mapping=None,
     chunks_size=1000,
     default_fps=20,
-    features_to_keep=None, # 新增参数
-    remove_eef_flag=False
+    features_to_keep=None,
+    remove_eef_flag=False,
+    features_def=None
 ):
     """
-    复制并处理parquet数据文件，包括维度填充和索引更新
-    (Copy and process parquet data files, including dimension padding and index updates)
-
-    Args:
-        source_folders (list): 源数据集文件夹路径列表 (List of source dataset folder paths)
-        output_folder (str): 输出文件夹路径 (Output folder path)
-        episode_mapping (list): 包含(旧文件夹,旧索引,新索引)元组的列表
-                               (List of tuples containing (old_folder, old_index, new_index))
-        max_dim (int): 向量的最大维度 (Maximum dimension for vectors)
-        fps (float, optional): 帧率，如果未提供则从第一个数据集获取 (Frame rate, if not provided will be obtained from the first dataset)
-        episode_to_frame_index (dict, optional): 每个新episode索引对应的起始帧索引映射
-                                               (Mapping of each new episode index to its starting frame index)
-        folder_task_mapping (dict, optional): 每个文件夹中task_index的映射关系
-                                            (Mapping of task_index for each folder)
-        chunks_size (int): 每个chunk包含的episode数量 (Number of episodes per chunk)
-        default_fps (float): 默认帧率，当无法从数据集获取时使用 (Default frame rate when unable to obtain from dataset)
-
-    Returns:
-        bool: 是否成功复制了至少一个文件 (Whether at least one file was successfully copied)
+    复制并处理parquet数据文件，使用 Pyarrow 强制执行严格的 Schema 类型转换
     """
-    # 获取第一个数据集的FPS（如果未提供）(Get FPS from first dataset if not provided)
     if fps is None:
         info_path = os.path.join(source_folders[0], "meta", "info.json")
         if os.path.exists(info_path):
             with open(info_path) as f:
                 info = json.load(f)
-                fps = info.get(
-                    "fps", default_fps
-                )  # 使用变量替代硬编码的20 (Use variable instead of hardcoded 20)
+                fps = info.get("fps", default_fps)
         else:
-            fps = default_fps  # 使用变量替代硬编码的20 (Use variable instead of hardcoded 20)
+            fps = default_fps
 
-    print(f"使用FPS={fps} (Using FPS={fps})")
-
-    # 为每个episode复制和处理数据文件 (Copy and process data files for each episode)
+    print(f"使用FPS={fps}")
     total_copied = 0
     total_failed = 0
-
-    # 添加一个列表来记录失败的文件及原因
-    # (Add a list to record failed files and reasons)
     failed_files = []
+    
     RESERVED_COLUMNS = SYSTEM_RESERVED_FIELDS
-    # === 辅助函数：统一的列过滤逻辑 ===
+
+    # === 1. 构建 Pyarrow Schema (基于 features_def 和 LeRobot 规范) ===
+    # 这是解决类型不匹配的核心
+    def _build_pyarrow_schema(df_columns, features_def):
+        fields = []
+        for col in df_columns:
+            # 默认类型
+            pa_type = pa.string()
+            
+            # --- 索引类 (强制 int64) ---
+            if col in ["frame_index", "episode_index", "index", "task_index"]:
+                pa_type = pa.int64()
+            
+            # --- 时间戳 (强制 float32) ---
+            elif col == "timestamp":
+                pa_type = pa.float32()
+            
+            # --- 特征定义匹配 ---
+            elif features_def and col in features_def:
+                feat = features_def[col]
+                dtype = feat.get("dtype")
+                shape = feat.get("shape")
+                
+                # 处理 float32 向量 (state, action)
+                if dtype == "float32":
+                    if shape and (len(shape) > 0 and shape != [1]): # 向量
+                        pa_type = pa.list_(pa.float32())
+                    else: # 标量
+                        pa_type = pa.float32()
+                        
+                # 处理 int32 向量/标量 (Annotations)
+                elif dtype == "int32":
+                    # 注意：如果 features_def 说它是 video，但这里出现在 parquet 里，那可能是 path 字符串，这里主要处理数值
+                    if shape and (len(shape) > 0 and shape != [1]): # 向量
+                        pa_type = pa.list_(pa.int32())
+                    else: # 标量
+                        pa_type = pa.int32()
+                        
+                # 处理图像路径等字符串
+                elif dtype == "video" or dtype == "string":
+                    pa_type = pa.string()
+            
+            # --- 兜底逻辑 (如果 features_def 没覆盖到) ---
+            else:
+                # 典型的 Annotation 列表推测为 int32 列表
+                if "annotation" in col or "gripper" in col or "eef" in col:
+                     # 简单判断：如果是 state/action 相关且不是 float，可能是 int32 列表
+                     pa_type = pa.list_(pa.int32())
+            
+            fields.append((col, pa_type))
+        
+        return pa.schema(fields)
+
+    # === 内部工具：过滤列 ===
     def _filter_columns(dataframe):
         if features_to_keep:
             cols_to_retain = set(features_to_keep)
             final_columns = []
             for col in dataframe.columns:
-                # 保留条件：用户指定 或 系统保留 或 指定字段的子属性
                 if (col in cols_to_retain or 
                     col in RESERVED_COLUMNS or 
                     any(col.startswith(f"{k}.") for k in cols_to_retain)):
                     final_columns.append(col)
-            
             if final_columns:
                 return dataframe[final_columns]
         return dataframe
-    # ===================================
+
     folder_meta_cache = {}
 
     for i, (old_folder, old_index, new_index) in enumerate(episode_mapping):
-        # 尝试找到源parquet文件 (Try to find source parquet file)
         episode_str = f"episode_{old_index:06d}.parquet"
         source_paths = [
             os.path.join(old_folder, "parquet", episode_str),
             os.path.join(old_folder, "data", episode_str),
         ]
-
         source_path = None
         for path in source_paths:
             if os.path.exists(path):
                 source_path = path
                 break
+        
+        if not source_path:
+             for root, _, files in os.walk(old_folder):
+                for file in files:
+                    if file.endswith(".parquet") and f"episode_{old_index:06d}" in file:
+                         source_path = os.path.join(root, file)
+                         break
+                if source_path: break
 
         if source_path:
             try:
-                # 读取parquet文件 (Read parquet file)
-                # 读取
-                df = pd.read_parquet(source_path) 
-                # 过滤列
+                df = pd.read_parquet(source_path)
                 df = _filter_columns(df)
-                # === 修改点2：更新过滤逻辑 ===
-                # 剔除
+                
+                # 剔除 EEF
                 if remove_eef_flag:
                     if old_folder not in folder_meta_cache:
                         src_info = get_info(old_folder)
@@ -1284,359 +1318,132 @@ def copy_data_files(
                     src_features = folder_meta_cache[old_folder]
                     for feat in ["observation.state", "action"]:
                         if feat in df.columns and feat in src_features:
-                            # 获取该数据集原始的 names
                             original_names = src_features[feat].get("names", [])
                             if original_names:
-                                # 计算需要保留的索引
                                 keep_idxs, _ = get_safe_indices(original_names)
-                                
-                                # 执行 numpy 切片：只保留 indices 对应的数据
-                                # 假设数据是 list 或 np.ndarray
                                 df[feat] = df[feat].apply(
                                     lambda x: np.array(x)[keep_idxs].tolist() 
-                                    if isinstance(x, (list, np.ndarray)) and len(x) >= len(original_names) # 暂时大于等于，因为数据有问题
-                                    else x
+                                    if isinstance(x, (list, np.ndarray)) and len(x) >= len(original_names) else x
                                 )
-                if features_to_keep:
-                    cols_to_retain = set(features_to_keep)
-                    final_columns = []
-                    
-                    for col in df.columns:
-                        # 保留条件：
-                        # 1. 是用户指定的 (如 observation.state)
-                        # 2. 是强制保留字段 (如 timestamp)
-                        # 3. 是用户指定字段的子属性 (如 observation.images.cam_high.path)
-                        if (col in cols_to_retain or 
-                            col in RESERVED_COLUMNS or 
-                            any(col.startswith(f"{k}.") for k in cols_to_retain)):
-                            final_columns.append(col)
-                    
-                    # 只有当筛选结果不为空时才覆盖，防止误删所有
-                    if final_columns:
-                        df = df[final_columns]
-                # 检查是否需要填充维度 (Check if dimensions need padding)
+
+                # 维度填充
                 for feature in ["observation.state", "action"]:
                     if feature in df.columns:
-                        # 检查第一个非空值 (Check first non-null value)
-                        for _idx, value in enumerate(df[feature]):
-                            if value is not None and isinstance(value, (list, np.ndarray)):
-                                current_dim = len(value)
-                                if current_dim < max_dim:
-                                    print(
-                                        f"填充 {feature} 从 {current_dim} 维到 {max_dim} 维 (Padding {feature} from {current_dim} to {max_dim} dimensions)"
-                                    )
-                                    # 使用零填充到目标维度 (Pad with zeros to target dimension)
-                                    df[feature] = df[feature].apply(
-                                        lambda x: np.pad(x, (0, max_dim - len(x)), "constant").tolist()
-                                        if x is not None
-                                        and isinstance(x, (list, np.ndarray))
-                                        and len(x) < max_dim
-                                        else x
-                                    )
-                                break
+                        first_val = df[feature].dropna().iloc[0] if not df[feature].dropna().empty else None
+                        if isinstance(first_val, (list, np.ndarray)):
+                             df[feature] = df[feature].apply(
+                                lambda x: np.pad(x, (0, max_dim - len(x)), "constant").tolist()
+                                if x is not None and isinstance(x, (list, np.ndarray)) and len(x) < max_dim else x
+                            )
 
-                # 更新episode_index列 (Update episode_index column)
+                # 更新索引
                 if "episode_index" in df.columns:
-                    print(
-                        f"更新episode_index从 {df['episode_index'].iloc[0]} 到 {new_index} (Update episode_index from {df['episode_index'].iloc[0]} to {new_index})"
-                    )
                     df["episode_index"] = new_index
 
-                # 更新index列 (Update index column)
                 if "index" in df.columns:
                     if episode_to_frame_index and new_index in episode_to_frame_index:
-                        # 使用预先计算的帧索引起始值 (Use pre-calculated frame index start value)
                         first_index = episode_to_frame_index[new_index]
-                        print(
-                            f"更新index列，起始值: {first_index}（使用全局累积帧计数）(Update index column, start value: {first_index} (using global cumulative frame count))"
-                        )
                     else:
-                        # 如果没有提供映射，使用当前的计算方式作为回退
-                        # (If no mapping provided, use current calculation as fallback)
                         first_index = new_index * len(df)
-                        print(
-                            f"更新index列，起始值: {first_index}（使用episode索引乘以长度）(Update index column, start value: {first_index} (using episode index multiplied by length))"
-                        )
-
-                    # 更新所有帧的索引 (Update indices for all frames)
                     df["index"] = [first_index + i for i in range(len(df))]
 
-                # 更新task_index列 (Update task_index column)
+                # 更新 Task Index
                 if "task_index" in df.columns and folder_task_mapping and old_folder in folder_task_mapping:
                     current_task_index = df["task_index"].iloc[0]
                     if current_task_index in folder_task_mapping[old_folder]:
-                        new_task_index = folder_task_mapping[old_folder][current_task_index]
-                        print(
-                            f"更新task_index从 {current_task_index} 到 {new_task_index} (Update task_index from {current_task_index} to {new_task_index})"
-                        )
-                        df["task_index"] = new_task_index
-                    else:
-                        print(
-                            f"警告: 找不到task_index {current_task_index}的映射关系 (Warning: No mapping found for task_index {current_task_index})"
-                        )
+                        df["task_index"] = folder_task_mapping[old_folder][current_task_index]
 
+                # 更新 Annotation 映射
                 if folder_annotations_mapping and old_folder in folder_annotations_mapping:
                     ann_map = folder_annotations_mapping[old_folder]
-                    if "subtask_annotation" in df.columns and "subtask_annotation" in ann_map:
-                        df["subtask_annotation"] = df["subtask_annotation"].apply(
-                            lambda x: [ann_map["subtask_annotation"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
-                        )
-                    if "scene_annotation" in df.columns and "scene_annotation" in ann_map:
-                        df["scene_annotation"] = df["scene_annotation"].apply(
-                            lambda x: [ann_map["scene_annotation"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
-                        )
-                    for col in ["gripper_mode_state", "gripper_mode_action"]:
-                        if col in df.columns and "gripper_mode" in ann_map:
-                            df[col] = df[col].apply(
-                                lambda x: [ann_map["gripper_mode"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
-                            )
-                    for col in ["gripper_activity_state", "gripper_activity_action"]:
-                        if col in df.columns and "gripper_activity" in ann_map:
-                            df[col] = df[col].apply(
-                                lambda x: [ann_map["gripper_activity"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
-                            )
-                    for col in ["eef_direction_state", "eef_direction_action"]:
-                        if col in df.columns and "eef_direction" in ann_map:
-                            df[col] = df[col].apply(
-                                lambda x: [ann_map["eef_direction"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
-                            )
-                    for col in ["eef_velocity_state", "eef_velocity_action"]:
-                        if col in df.columns and "eef_velocity" in ann_map:
-                            df[col] = df[col].apply(
-                                lambda x: [ann_map["eef_velocity"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
-                            )
-                    for col in ["eef_acc_mag_state", "eef_acc_mag_action"]:
-                        if col in df.columns and "eef_acc_mag" in ann_map:
-                            df[col] = df[col].apply(
-                                lambda x: [ann_map["eef_acc_mag"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
-                            )
+                    
+                    def apply_map(col_name, mapping_key):
+                        if col_name in df.columns and mapping_key in ann_map:
+                            first_val = df[col_name].dropna().iloc[0] if not df[col_name].dropna().empty else None
+                            is_list = isinstance(first_val, (list, np.ndarray))
+                            
+                            if is_list:
+                                df[col_name] = df[col_name].apply(
+                                    lambda x: [ann_map[mapping_key].get(int(v), int(v)) for v in x] if isinstance(x, list) else x
+                                )
+                            else:
+                                df[col_name] = df[col_name].apply(
+                                    lambda x: ann_map[mapping_key].get(int(x), int(x)) if pd.notnull(x) else x
+                                )
 
-                # 计算chunk编号 (Calculate chunk number)
+                    # 应用映射
+                    mapping_configs = [
+                        ("subtask_annotation", "subtask_annotation"),
+                        ("scene_annotation", "scene_annotation"),
+                        ("gripper_mode_state", "gripper_mode"), ("gripper_mode_action", "gripper_mode"),
+                        ("gripper_activity_state", "gripper_activity"), ("gripper_activity_action", "gripper_activity"),
+                        ("eef_direction_state", "eef_direction"), ("eef_direction_action", "eef_direction"),
+                        ("eef_velocity_state", "eef_velocity"), ("eef_velocity_action", "eef_velocity"),
+                        ("eef_acc_mag_state", "eef_acc_mag"), ("eef_acc_mag_action", "eef_acc_mag")
+                    ]
+                    for col, key in mapping_configs:
+                        apply_map(col, key)
+                
+                # === 标量修正 (Flatten Scalars) ===
+                # 这一步必须在转 Table 之前做，确保数据形状正确
+                scalar_candidates = ["scene_annotation", "task_index", "frame_index", "episode_index", "index"]
+                for col in df.columns:
+                    should_flatten = False
+                    if features_def and col in features_def:
+                        target_shape = features_def[col].get("shape")
+                        if target_shape is None or target_shape == 1 or target_shape == [1]:
+                             should_flatten = True
+                    elif col in scalar_candidates:
+                        should_flatten = True
+                    
+                    if should_flatten:
+                        first_val = df[col].dropna().iloc[0] if not df[col].dropna().empty else None
+                        if isinstance(first_val, (list, np.ndarray)):
+                             df[col] = df[col].apply(lambda x: x[0] if isinstance(x, (list, np.ndarray)) and len(x) > 0 else (x if x is not None else 0))
+
+                # === 2. 转换为 Pyarrow Table 并强制转换类型 ===
+                # 构建目标 Schema
+                target_schema = _build_pyarrow_schema(df.columns, features_def)
+                
+                # 将 Pandas DF 转为 Table，并应用 Schema
+                # 这会自动处理 float64->float32, int64->int32 等转换
+                try:
+                    table = pa.Table.from_pandas(df, schema=target_schema, preserve_index=False)
+                except Exception as cast_err:
+                    print(f"Pyarrow casting error in {source_path}: {cast_err}")
+                    # 如果自动转换失败（例如 list<double> -> list<float32> 有时会报错），尝试手动 numpy 转换后再转 table
+                    for col in df.columns:
+                        if target_schema.field(col).type == pa.float32():
+                            df[col] = df[col].astype("float32")
+                        elif target_schema.field(col).type == pa.int64():
+                            df[col] = df[col].astype("int64")
+                        elif target_schema.field(col).type == pa.int32():
+                            df[col] = df[col].astype("int32")
+                    # 再次尝试
+                    table = pa.Table.from_pandas(df, schema=target_schema, preserve_index=False)
+
+                # 3. 保存
                 chunk_index = new_index // chunks_size
-
-                # 创建正确的目标目录 (Create correct target directory)
                 chunk_dir = os.path.join(output_folder, "data", f"chunk-{chunk_index:03d}")
                 os.makedirs(chunk_dir, exist_ok=True)
-
-                # 构建正确的目标路径 (Build correct target path)
                 dest_path = os.path.join(chunk_dir, f"episode_{new_index:06d}.parquet")
-
-                # 保存到正确位置 (Save to correct location)
-                df.to_parquet(dest_path, index=False)
-
+                
+                pq.write_table(table, dest_path)
+                
                 total_copied += 1
-                print(f"已处理并保存: {dest_path} (Processed and saved: {dest_path})")
+                if total_copied % 10 == 0:
+                    print(f"Processed {total_copied} files...", end='\r')
 
             except Exception as e:
-                error_msg = f"处理 {source_path} 失败: {e} (Processing {source_path} failed: {e})"
-                print(error_msg)
+                print(f"Error processing {source_path}: {e}")
                 traceback.print_exc()
                 failed_files.append({"file": source_path, "reason": str(e), "episode": old_index})
                 total_failed += 1
         else:
-            # 文件不在标准位置，尝试递归搜索
-            found = False
-            for root, _, files in os.walk(old_folder):
-                for file in files:
-                    if file.endswith(".parquet") and f"episode_{old_index:06d}" in file:
-                        try:
-                            source_path = os.path.join(root, file)
+            print(f"Warning: File not found for episode {old_index} in {old_folder}")
+            total_failed += 1
 
-                            # 读取parquet文件 (Read parquet file)
-                            df = pd.read_parquet(source_path)
-                            df = _filter_columns(df)
-
-                            if remove_eef_flag:
-                                if old_folder not in folder_meta_cache:
-                                    src_info = get_info(old_folder)
-                                    folder_meta_cache[old_folder] = src_info["features"]
-                                src_features = folder_meta_cache[old_folder]
-                                for feat in ["observation.state", "action"]:
-                                    if feat in df.columns and feat in src_features:
-                                        # 获取该数据集原始的 names
-                                        original_names = src_features[feat].get("names", [])
-                                        if original_names:
-                                            # 计算需要保留的索引
-                                            keep_idxs, _ = get_safe_indices(original_names)
-                                            
-                                            # 执行 numpy 切片：只保留 indices 对应的数据
-                                            # 假设数据是 list 或 np.ndarray
-                                            df[feat] = df[feat].apply(
-                                                lambda x: np.array(x)[keep_idxs].tolist() 
-                                                if isinstance(x, (list, np.ndarray)) and len(x) >= len(original_names)  # 暂时大于等于，因为数据有问题 shape 与 names 数量没对上
-                                                else x
-                                            )
-
-                            if features_to_keep:
-                                cols_to_retain = set(features_to_keep)
-                                final_columns = []
-                                
-                                for col in df.columns:
-                                    # 保留条件：
-                                    # 1. 是用户指定的 (如 observation.state)
-                                    # 2. 是强制保留字段 (如 timestamp)
-                                    # 3. 是用户指定字段的子属性 (如 observation.images.cam_high.path)
-                                    if (col in cols_to_retain or 
-                                        col in RESERVED_COLUMNS or 
-                                        any(col.startswith(f"{k}.") for k in cols_to_retain)):
-                                        final_columns.append(col)
-                                
-                                # 只有当筛选结果不为空时才覆盖，防止误删所有
-                                if final_columns:
-                                    df = df[final_columns]                            
-                            # === 修改点2：更新过滤逻辑 ===
-                            # 检查是否需要填充维度 (Check if dimensions need padding)
- 
-                            for feature in ["observation.state", "action"]:
-                                if feature in df.columns:
-                                    # 检查第一个非空值 (Check first non-null value)
-                                    for _idx, value in enumerate(df[feature]):
-                                        if value is not None and isinstance(value, (list, np.ndarray)):
-                                            current_dim = len(value)
-                                            if current_dim < max_dim:
-                                                print(
-                                                    f"填充 {feature} 从 {current_dim} 维到 {max_dim} 维 (Padding {feature} from {current_dim} to {max_dim} dimensions)"
-                                                )
-                                                # 使用零填充到目标维度 (Pad with zeros to target dimension)
-                                                df[feature] = df[feature].apply(
-                                                    lambda x: np.pad(
-                                                        x, (0, max_dim - len(x)), "constant"
-                                                    ).tolist()
-                                                    if x is not None
-                                                    and isinstance(x, (list, np.ndarray))
-                                                    and len(x) < max_dim
-                                                    else x
-                                                )
-                                            break
-
-                            # 更新episode_index列 (Update episode_index column)
-                            if "episode_index" in df.columns:
-                                print(
-                                    f"更新episode_index从 {df['episode_index'].iloc[0]} 到 {new_index} (Update episode_index from {df['episode_index'].iloc[0]} to {new_index})"
-                                )
-                                df["episode_index"] = new_index
-
-                            # 更新index列 (Update index column)
-                            if "index" in df.columns:
-                                if episode_to_frame_index and new_index in episode_to_frame_index:
-                                    # 使用预先计算的帧索引起始值 (Use pre-calculated frame index start value)
-                                    first_index = episode_to_frame_index[new_index]
-                                    print(
-                                        f"更新index列，起始值: {first_index}（使用全局累积帧计数）(Update index column, start value: {first_index} (using global cumulative frame count))"
-                                    )
-                                else:
-                                    # 如果没有提供映射，使用当前的计算方式作为回退
-                                    # (If no mapping provided, use current calculation as fallback)
-                                    first_index = new_index * len(df)
-                                    print(
-                                        f"更新index列，起始值: {first_index}（使用episode索引乘以长度）(Update index column, start value: {first_index} (using episode index multiplied by length))"
-                                    )
-
-                                # 更新所有帧的索引 (Update indices for all frames)
-                                df["index"] = [first_index + i for i in range(len(df))]
-
-                            # 更新task_index列 (Update task_index column)
-                            if (
-                                "task_index" in df.columns
-                                and folder_task_mapping
-                                and old_folder in folder_task_mapping
-                            ):
-                                current_task_index = df["task_index"].iloc[0]
-                                if current_task_index in folder_task_mapping[old_folder]:
-                                    new_task_index = folder_task_mapping[old_folder][current_task_index]
-                                    print(
-                                        f"更新task_index从 {current_task_index} 到 {new_task_index} (Update task_index from {current_task_index} to {new_task_index})"
-                                    )
-                                    df["task_index"] = new_task_index
-                                else:
-                                    print(
-                                        f"警告: 找不到task_index {current_task_index}的映射关系 (Warning: No mapping found for task_index {current_task_index})"
-                                    )
-
-                            if folder_annotations_mapping and old_folder in folder_annotations_mapping:
-                                ann_map = folder_annotations_mapping[old_folder]
-                                if "subtask_annotation" in df.columns and "subtask_annotation" in ann_map:
-                                    df["subtask_annotation"] = df["subtask_annotation"].apply(
-                                        lambda x: [ann_map["subtask_annotation"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
-                                    )
-                                if "scene_annotation" in df.columns and "scene_annotation" in ann_map:
-                                    df["scene_annotation"] = df["scene_annotation"].apply(
-                                        lambda x: [ann_map["scene_annotation"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
-                                    )
-                                for col in ["gripper_mode_state", "gripper_mode_action"]:
-                                    if col in df.columns and "gripper_mode" in ann_map:
-                                        df[col] = df[col].apply(
-                                            lambda x: [ann_map["gripper_mode"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
-                                        )
-                                for col in ["gripper_activity_state", "gripper_activity_action"]:
-                                    if col in df.columns and "gripper_activity" in ann_map:
-                                        df[col] = df[col].apply(
-                                            lambda x: [ann_map["gripper_activity"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
-                                        )
-                                for col in ["eef_direction_state", "eef_direction_action"]:
-                                    if col in df.columns and "eef_direction" in ann_map:
-                                        df[col] = df[col].apply(
-                                            lambda x: [ann_map["eef_direction"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
-                                        )
-                                for col in ["eef_velocity_state", "eef_velocity_action"]:
-                                    if col in df.columns and "eef_velocity" in ann_map:
-                                        df[col] = df[col].apply(
-                                            lambda x: [ann_map["eef_velocity"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
-                                        )
-                                for col in ["eef_acc_mag_state", "eef_acc_mag_action"]:
-                                    if col in df.columns and "eef_acc_mag" in ann_map:
-                                        df[col] = df[col].apply(
-                                            lambda x: [ann_map["eef_acc_mag"].get(int(v), int(v)) for v in (x if isinstance(x, (list, np.ndarray)) else [x])] if x is not None else x
-                                        )
-
-                            # 计算chunk编号 (Calculate chunk number)
-                            chunk_index = new_index // chunks_size
-
-                            # 创建正确的目标目录 (Create correct target directory)
-                            chunk_dir = os.path.join(output_folder, "data", f"chunk-{chunk_index:03d}")
-                            os.makedirs(chunk_dir, exist_ok=True)
-
-                            # 构建正确的目标路径 (Build correct target path)
-                            dest_path = os.path.join(chunk_dir, f"episode_{new_index:06d}.parquet")
-
-                            # 保存到正确位置 (Save to correct location)
-                            df.to_parquet(dest_path, index=False)
-
-                            total_copied += 1
-                            found = True
-                            print(f"已处理并保存: {dest_path} (Processed and saved: {dest_path})")
-                            break
-                        except Exception as e:
-                            error_msg = f"处理 {source_path} 失败: {e} (Processing {source_path} failed: {e})"
-                            print(error_msg)
-                            traceback.print_exc()
-                            failed_files.append({"file": source_path, "reason": str(e), "episode": old_index})
-                            total_failed += 1
-                if found:
-                    break
-
-            if not found:
-                error_msg = f"找不到episode {old_index}的parquet文件，源文件夹: {old_folder}"
-                print(error_msg)
-                failed_files.append(
-                    {"file": f"episode_{old_index:06d}.parquet", "reason": "文件未找到", "folder": old_folder}
-                )
-                total_failed += 1
-
-    print(f"共复制 {total_copied} 个数据文件，{total_failed} 个失败")
-
-    # 打印所有失败的文件详情 (Print details of all failed files)
-    if failed_files:
-        print("\n失败的文件详情 (Details of failed files):")
-        for i, failed in enumerate(failed_files):
-            print(f"{i + 1}. 文件 (File): {failed['file']}")
-            if "folder" in failed:
-                print(f"   文件夹 (Folder): {failed['folder']}")
-            if "episode" in failed:
-                print(f"   Episode索引 (Episode index): {failed['episode']}")
-            print(f"   原因 (Reason): {failed['reason']}")
-            print("---")
-
+    print(f"\n共复制 {total_copied} 个数据文件，{total_failed} 个失败")
     return total_copied > 0
 
 
