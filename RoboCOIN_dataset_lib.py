@@ -13,6 +13,32 @@ SYSTEM_RESERVED_FIELDS = [
     "subtask_annotation", "scene_annotation", 
 ]
 
+def get_resample_indices(source_length, src_fps, target_fps):
+    """
+    计算从 src_fps 重采样到 target_fps 需要保留的源帧索引
+    使用最近邻插值以最小化时间漂移
+    """
+    if target_fps is None or src_fps is None or src_fps == target_fps:
+        return None
+    
+    # 目标总时长保持不变，计算新的帧数
+    duration = source_length / src_fps
+    target_length = int(np.ceil(duration * target_fps)) # 使用ceil防止丢尾
+    
+    if target_length == 0:
+        return []
+
+    # 生成目标时间戳序列: 0, 0.033, 0.066 ...
+    target_timestamps = np.arange(target_length) / target_fps
+    
+    # 映射回源帧索引: time * src_fps
+    source_indices = np.round(target_timestamps * src_fps).astype(int)
+    
+    # 防止浮点误差导致的越界
+    source_indices = np.clip(source_indices, 0, source_length - 1)
+    
+    return source_indices
+
 def get_safe_indices(names_list):
     """
     根据列名列表，返回需要保留的索引列表。
@@ -112,7 +138,7 @@ def save_jsonl(data, file_path):
 
 import subprocess # 记得在文件顶部导入这个
 
-def process_video_pad(src_path, dst_path, target_w, target_h):
+def process_video_pad(src_path, dst_path, target_w, target_h, target_fps=None): 
     """
     使用系统 FFmpeg 命令对视频进行缩放并填充黑边 (Letterbox)。
     这比 OpenCV 更稳健，能解决 AV1 解码问题，且速度更快。
@@ -142,11 +168,15 @@ def process_video_pad(src_path, dst_path, target_w, target_h):
         "-loglevel", "error",
         "-i", src_path,
         "-vf", vf_filter,
+    ]
+    if target_fps is not None:
+        cmd.extend(["-r", str(target_fps)])
+        
+    cmd.extend([
         "-c:v", "libx264", 
         "-pix_fmt", "yuv420p",
         dst_path
-    ]
-
+    ])
     try:
         # 执行命令
         result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -662,6 +692,31 @@ def write_meta_and_copy(
         pad_episode_stats(stats, from_dim=actual_max_dim, to_dim=actual_max_dim)
         aligned_episode_stats.append(stats)
 
+    # === 新增：预先计算重采样后的长度 ===
+    total_frames_resampled = 0
+    folder_fps_cache = {} # 缓存每个文件夹的FPS
+
+    for ep in all_episodes:
+        # 获取该 episode 的源 FPS
+        src_folder = episode_source_map[ep["episode_index"]]
+        if src_folder not in folder_fps_cache:
+            folder_fps_cache[src_folder] = get_info(src_folder).get("fps", fps)
+        
+        src_fps = folder_fps_cache[src_folder]
+        
+        # 如果需要重采样，更新 length
+        if fps is not None and src_fps != fps:
+            # 模拟计算新的长度
+            original_len = ep["length"]
+            # 计算简单的缩放比例 (必须与 get_resample_indices 逻辑一致)
+            duration = original_len / src_fps
+            new_len = int(np.ceil(duration * fps))
+            ep["length"] = new_len
+        
+        total_frames_resampled += ep["length"]
+
+    # 更新全局的总帧数
+    base_info["total_frames"] = total_frames_resampled
     save_jsonl(all_episodes, os.path.join(output_folder, "meta", "episodes.jsonl"))
     save_jsonl(aligned_episode_stats, os.path.join(output_folder, "meta", "episodes_stats.jsonl"))
 
@@ -722,7 +777,7 @@ def write_meta_and_copy(
 
     # 复制视频和数据
     if video_keys:
-        copy_videos(source_folders, output_folder, episode_mapping, video_size=video_size, filtered_features=base_info["features"])
+        copy_videos(source_folders, output_folder, episode_mapping, video_size=video_size, filtered_features=base_info["features"], fps=fps)
     
     # 这里的 max_dim 必须传 actual_max_dim，确保 parquet 文件也填充到统一维度
     copy_data_files(
@@ -1005,7 +1060,7 @@ def merge_stats(stats_list):
     return merged_stats
 
 
-def copy_videos(source_folders, output_folder, episode_mapping, video_size=None, filtered_features=None):
+def copy_videos(source_folders, output_folder, episode_mapping, video_size=None, filtered_features=None, fps=None):
     """
     从源文件夹复制视频文件到输出文件夹，保持正确的索引和结构
     (Copy video files from source folders to output folder, maintaining correct indices and structure)
@@ -1081,15 +1136,23 @@ def copy_videos(source_folders, output_folder, episode_mapping, video_size=None,
                     target_w, target_h = video_size
                     need_convert = True
                     try:
-                        cap = cv2.VideoCapture(source_video_path)
-                        if cap.isOpened():
-                            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                            cap.release()
-                            if w == target_w and h == target_h:
-                                need_convert = False
-                                print(f"Skipping convert (size match {w}x{h}): {source_video_path} -> Copying...")
-                        process_video_pad(source_video_path, dest_video_path, target_w, target_h)
+                        cmd = [
+                            "ffprobe", 
+                            "-v", "error", 
+                            "-select_streams", "v:0", 
+                            "-show_entries", "stream=width,height", 
+                            "-of", "csv=s=x:p=0", 
+                            source_video_path
+                        ]
+                        output = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode("utf-8").strip()
+                        if output:
+                            parts = output.split('x')
+                            if len(parts) == 2:
+                                w, h = int(parts[0]), int(parts[1])
+                                if w == target_w and h == target_h:
+                                    need_convert = False
+                                    print(f"Skipping convert (size match {w}x{h}): {source_video_path} -> Copying...")
+                                    
                     except Exception as e:
                         print(f"Check video size failed: {e}, will force convert.")
                         # 失败时回退到直接复制
@@ -1097,7 +1160,7 @@ def copy_videos(source_folders, output_folder, episode_mapping, video_size=None,
                     if need_convert:
                         print(f"Processing video (Resize/Pad): {source_video_path} -> {dest_video_path}")
                         try:
-                            process_video_pad(source_video_path, dest_video_path, target_w, target_h)
+                            process_video_pad(source_video_path, dest_video_path, target_w, target_h, target_fps=fps)
                         except Exception as e:
                             print(f"Error processing video {source_video_path}: {e}")
                             shutil.copy2(source_video_path, dest_video_path)
@@ -1208,7 +1271,7 @@ def copy_data_files(
     folder_task_mapping=None,
     folder_annotations_mapping=None,
     chunks_size=1000,
-    default_fps=20,
+    default_fps=30,
     features_to_keep=None,
     remove_eef_flag=False,
     features_def=None
@@ -1323,6 +1386,22 @@ def copy_data_files(
         if source_path:
             try:
                 df = pd.read_parquet(source_path)
+                # === 新增：帧率重采样 (最小化漂移核心逻辑) ===
+                # 1. 获取源 FPS
+                src_info = get_info(old_folder)
+                src_fps = src_info.get("fps", default_fps)
+                
+                # 2. 计算需要保留的索引
+                # fps 是传入的目标 FPS (arg: fps)
+                if fps is not None and src_fps != fps:
+                    # 使用上面定义的工具函数
+                    indices = get_resample_indices(len(df), src_fps, fps)
+                    if indices is not None and len(indices) > 0:
+                        # 核心：按索引切片
+                        df = df.iloc[indices]
+                        # 重置索引，防止 frame_index 不连续
+                        df.reset_index(drop=True, inplace=True)
+                    # ==========================================
                 df = _filter_columns(df)
                 
                 # 剔除 EEF
@@ -1886,7 +1965,7 @@ def merge_datasets(
         json.dump(info, f, indent=4)
 
     # Copy video and data files
-    copy_videos(source_folders, output_folder, episode_mapping)
+    copy_videos(source_folders, output_folder, episode_mapping, fps=fps)
     copy_data_files(
         source_folders,
         output_folder,
