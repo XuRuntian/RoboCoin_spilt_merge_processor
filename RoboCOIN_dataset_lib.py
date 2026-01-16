@@ -11,10 +11,6 @@ import cv2
 SYSTEM_RESERVED_FIELDS = [
     "episode_index", "frame_index", "timestamp", "index", "task_index", 
     "subtask_annotation", "scene_annotation", 
-    "eef_direction_state", "eef_direction_action",
-    "eef_velocity_state", "eef_velocity_action",
-    "gripper_mode_state", "gripper_mode_action",
-    "gripper_activity_state", "gripper_activity_action"
 ]
 
 def get_safe_indices(names_list):
@@ -1083,16 +1079,35 @@ def copy_videos(source_folders, output_folder, episode_mapping, video_size=None,
                 # === 处理逻辑 ===
                 if video_size is not None:
                     target_w, target_h = video_size
-                    print(f"Processing video: {source_video_path} -> {dest_video_path}") 
+                    need_convert = True
                     try:
+                        cap = cv2.VideoCapture(source_video_path)
+                        if cap.isOpened():
+                            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                            cap.release()
+                            if w == target_w and h == target_h:
+                                need_convert = False
+                                print(f"Skipping convert (size match {w}x{h}): {source_video_path} -> Copying...")
                         process_video_pad(source_video_path, dest_video_path, target_w, target_h)
                     except Exception as e:
-                        print(f"Error processing video {source_video_path}: {e}")
+                        print(f"Check video size failed: {e}, will force convert.")
                         # 失败时回退到直接复制
+                        need_convert = True
+                    if need_convert:
+                        print(f"Processing video (Resize/Pad): {source_video_path} -> {dest_video_path}")
+                        try:
+                            process_video_pad(source_video_path, dest_video_path, target_w, target_h)
+                        except Exception as e:
+                            print(f"Error processing video {source_video_path}: {e}")
+                            shutil.copy2(source_video_path, dest_video_path)
+                    else:
+                        # 直接复制，速度极快
                         shutil.copy2(source_video_path, dest_video_path)
+
+
                 else:
                     # 原有逻辑：直接复制
-                    # print(f"Copying video: {source_video_path} -> {dest_video_path}")
                     shutil.copy2(source_video_path, dest_video_path)
             else:
                 # === 修改点：删除了原来的递归搜索 (os.walk) ===

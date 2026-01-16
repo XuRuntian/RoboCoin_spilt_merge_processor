@@ -5,18 +5,13 @@ import shutil
 from pathlib import Path
 
 # === 配置区域 ===
-# 目标标准名称 (LeRobot v3.0 默认期望的名称)
+# 目标标准名称 (LeRobot v3.0 默认期望的名称 - High Camera)
 TARGET_HIGH_NAME = "observation.images.cam_high_rgb"
 
 # 触发关键词 (只要现有相机名包含这些词，且不叫 cam_high_rgb，就会被重命名)
+# 注意：这主要用于识别名字乱七八糟的主视角相机
 KEYWORDS = ["head", "front", "font"] 
 
-# (旧逻辑配置，目前已失效，不再根据此名单删除数据)
-ALLOWED_CAMERAS = {
-    "observation.images.cam_high_rgb",
-    "observation.images.cam_left_wrist_rgb",
-    "observation.images.cam_right_wrist_rgb"
-}
 # =================
 
 def update_jsonl_stats(file_path, info_rename_map, dry_run=False):
@@ -62,14 +57,20 @@ def update_jsonl_stats(file_path, info_rename_map, dry_run=False):
             current_key = key
             
             # --- 步骤 1: 重命名逻辑 ---
-            # 优先使用 info.json 的映射
+            # A. 优先使用 info.json 的映射 (这里包含了 _rgb_rgb 的修复映射)
             if current_key in info_rename_map:
                 current_key = info_rename_map[current_key]
-            # 其次检查关键词
+            
+            # B. 其次检查关键词 (针对未在 info 中定义的漏网之鱼，防止万一 stats 里有 info 里没有的 key)
             elif current_key != TARGET_HIGH_NAME and current_key.startswith("observation.images."):
-                is_bad_name = any(kw in current_key.lower() for kw in KEYWORDS)
-                if is_bad_name:
-                    current_key = TARGET_HIGH_NAME
+                # 额外修复：如果 stats 里的 key 也有 _rgb_rgb 错误
+                if current_key.endswith("_rgb_rgb"):
+                     current_key = current_key.replace("_rgb_rgb", "_rgb")
+                     row_modified = True
+                else:
+                    is_bad_name = any(kw in current_key.lower() for kw in KEYWORDS)
+                    if is_bad_name:
+                        current_key = TARGET_HIGH_NAME
             
             # 检测是否发生了改名
             if current_key != key:
@@ -125,12 +126,25 @@ def process_single_dataset(dataset_path, dry_run=False):
     # --- 2. 构建重命名映射 (基于 info.json) ---
     for key in features.keys():
         if not key.startswith("observation.images."): continue
+
+        # === 新增逻辑：优先修复双重后缀错误 ===
+        # 检查是否以 _rgb_rgb 结尾
+        if key.endswith("_rgb_rgb"):
+            # 去掉最后4个字符 (_rgb)
+            corrected_name = key[:-4] 
+            print(f"    🛠️ 发现双重后缀错误: '{key}' -> 修正为 '{corrected_name}'")
+            rename_map[key] = corrected_name
+            # 如果匹配了这个错误，直接进入下一次循环，不再进行后续关键词检查
+            continue 
+        # =================================
+
         if key == TARGET_HIGH_NAME: continue
 
+        #原本的关键词逻辑 (处理 head/front 等不规范命名)
         lower_key = key.lower()
         for kw in KEYWORDS:
             if kw in lower_key:
-                print(f"    🎯 info.json 发现目标: '{key}' -> 标记为 '{TARGET_HIGH_NAME}'")
+                print(f"    🎯 info.json 发现旧标准名: '{key}' -> 标记为 '{TARGET_HIGH_NAME}'")
                 rename_map[key] = TARGET_HIGH_NAME
                 break
 
@@ -140,7 +154,7 @@ def process_single_dataset(dataset_path, dry_run=False):
     new_features = {}
     
     for key, value in features.items():
-        # 3.1 获取最终名称
+        # 3.1 获取最终名称 (如果有映射就用新的，没有就用旧的)
         final_key = rename_map.get(key, key)
         
         # 3.2 直接保留 (不做过滤)
@@ -193,12 +207,15 @@ def process_single_dataset(dataset_path, dry_run=False):
                             continue
 
                         if new_video_dir.exists():
-                            # 如果目标文件夹已存在，把文件移过去
+                            # 如果目标文件夹已存在 (极端情况)，把文件移过去
+                            print(f"    ⚠️ 目标文件夹已存在，正在合并: {new_video_dir}")
                             for item in old_video_dir.iterdir():
                                 try:
-                                    shutil.move(str(item), str(new_video_dir / item.name))
-                                except Exception:
-                                    pass # 忽略移动错误
+                                    target_file = new_video_dir / item.name
+                                    if not target_file.exists():
+                                        shutil.move(str(item), str(target_file))
+                                except Exception as e:
+                                    print(f"    ❌ 移动文件失败: {e}")
                             try:
                                 old_video_dir.rmdir()
                             except:
@@ -207,8 +224,8 @@ def process_single_dataset(dataset_path, dry_run=False):
                             try:
                                 old_video_dir.rename(new_video_dir)
                                 print(f"    ✨ 文件夹重命名成功: {old_name} -> {new_name}")
-                            except OSError:
-                                pass
+                            except OSError as e:
+                                print(f"    ❌ 重命名失败: {e}")
 
     return True, "Success"
 
@@ -232,11 +249,11 @@ def auto_detect_and_run(input_path, dry_run=False):
         print(f"\n🎉 处理完成，共扫描有效数据集: {count} 个")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="自动修复相机名称 (不删除任何数据)")
+    parser = argparse.ArgumentParser(description="自动修复相机名称 (修复 _rgb_rgb 及规范化)")
     parser.add_argument("--input", required=True, help="数据集路径")
     parser.add_argument("--dry-run", action="store_true", help="试运行模式")
     
     args = parser.parse_args()
     
-    print("🚀 开始执行：仅重命名相机...")
+    print("🚀 开始执行：修复相机名称...")
     auto_detect_and_run(args.input, args.dry_run)
