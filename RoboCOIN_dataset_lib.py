@@ -513,7 +513,7 @@ def write_meta_and_copy(
     folder_dimensions,
     folder_task_mapping,
     folder_annotations_mapping,
-    episode_to_frame_index,
+    episode_to_frame_index, # 注意：这是基于原始长度的旧映射，下面会重新计算
     all_stats_data,
     all_tasks,
     all_annotations,
@@ -527,53 +527,36 @@ def write_meta_and_copy(
     os.makedirs(output_folder, exist_ok=True)
     os.makedirs(os.path.join(output_folder, "meta"), exist_ok=True)
 
-    # 1. 建立 Episode Index -> Source Folder 的映射
     episode_source_map = {new_idx: folder for folder, _, new_idx in episode_mapping}
-
-    # 2. 预扫描所有文件夹：计算各自的切片索引，并寻找全局最大维度
     folder_indices_map = {} 
-    # 用于记录每个特征在所有数据集中出现过的最大维度 (切片后)
-    global_max_dims_map = {} # {'observation.state': 14, 'action': 16}
-    # 记录哪个文件夹提供了这个最大维度，以便后续借用其 names
+    global_max_dims_map = {} 
     max_dim_source_folder = {} 
 
     base_info = get_info(source_folders[0])
     
-    # 遍历所有源文件夹
     for folder in source_folders:
         current_info = get_info(folder)
         current_indices = {}
-        
-        # 如果启用了 remove_eef，计算该文件夹特定的保留索引
         if remove_eef:
             for feat in ["observation.state", "action"]:
                 if feat in current_info.get("features", {}):
                     names = current_info["features"][feat].get("names", [])
-                    # 计算索引
                     indices = []
                     kept_names = []
                     if names:
                         indices, kept_names = get_safe_indices(names)
                     else:
-                        # 如果没有names，则假设保留所有（或根据shape）
-                        # 这里简单处理：如果没names，可能不需要切片，或者无法切片
-                        # 但为了安全，如果有shape，我们记录维度
                         shape = current_info["features"][feat].get("shape", [0])
                         indices = list(range(shape[0]))
                         kept_names = [f"dim_{i}" for i in indices]
 
                     current_indices[feat] = indices
-                    
-                    # 更新全局最大维度记录
                     sliced_dim = len(indices)
                     if feat not in global_max_dims_map or sliced_dim > global_max_dims_map[feat]:
                         global_max_dims_map[feat] = sliced_dim
                         max_dim_source_folder[feat] = folder
-
         folder_indices_map[folder] = current_indices
 
-    # 3. 确定最终的全局统一维度 (actual_max_dim)
-    # 取 state 和 action 中较大的那个，或者是 CLI 指定的
     detected_max_dim = 0
     if global_max_dims_map:
         detected_max_dim = max(global_max_dims_map.values())
@@ -581,8 +564,6 @@ def write_meta_and_copy(
     original_max_dim = max_dim_cli or max(folder_dimensions.values())
     
     if detected_max_dim > 0:
-        # 如果检测到了切片后的维度（通常会比原始的小，但也可能不同源不一致）
-        # 我们必须确保 actual_max_dim 足够容纳所有源的最大切片维度
         if max_dim_cli:
             actual_max_dim = max(max_dim_cli, detected_max_dim)
         else:
@@ -591,30 +572,24 @@ def write_meta_and_copy(
     else:
         actual_max_dim = max_dim_cli or original_max_dim
 
-    # 4. 更新 info.json (使用提供最大维度的那个文件夹的 names，防止 names 长度与 shape 不匹配)
     if remove_eef:
         for feat in ["observation.state", "action"]:
-            # 如果我们计算出了新的维度
             if feat in global_max_dims_map:
-                # 更新 shape
                 if feat not in base_info["features"]:
-                    continue # 如果模板里没有这个特征，跳过
+                    continue 
 
                 base_info["features"][feat]["shape"] = [actual_max_dim]
                 
-                # 尝试更新 names (从拥有最大维度的文件夹里拿)
                 src_folder = max_dim_source_folder.get(feat)
                 if src_folder:
                     src_info = get_info(src_folder)
                     src_names = src_info["features"][feat].get("names", [])
                     if src_names:
                         _, kept_names = get_safe_indices(src_names)
-                        # 如果 names 长度不足 actual_max_dim (例如 padded)，需要补齐
                         if len(kept_names) < actual_max_dim:
                             kept_names += [f"pad_{i}" for i in range(len(kept_names), actual_max_dim)]
                         base_info["features"][feat]["names"] = kept_names
 
-    # 5. 过滤字段 (Features Filtering)
     RESERVED_FEATURES = SYSTEM_RESERVED_FIELDS
     if features_to_keep:
         print(f"筛选特定字段: {features_to_keep}")
@@ -641,7 +616,6 @@ def write_meta_and_copy(
     total_episodes = len(all_episodes)
     total_videos = len(video_keys) * total_episodes
 
-    # 6. 处理 episodes_stats (切片 + 填充)
     aligned_episode_stats = []
     features_set = set(features_to_keep) if features_to_keep else None
 
@@ -660,10 +634,9 @@ def write_meta_and_copy(
                 elif k in features_set or k in RESERVED_FEATURES:
                     keep = True
                 else:
-                    pass # 子属性检查略
+                    pass 
                 
                 if keep:
-                    # 使用该 episode 对应源文件夹的索引进行切片
                     if k in current_folder_indices:
                         indices = current_folder_indices[k]
                         sliced_v = {}
@@ -671,7 +644,6 @@ def write_meta_and_copy(
                             if stat_key in ["min", "max", "mean", "std"] and isinstance(stat_val, list):
                                 try:
                                     arr = np.array(stat_val)
-                                    # 维度保护
                                     if len(arr) > len(indices) or (arr.ndim > 0 and arr.shape[0] >= len(indices)):
                                          sliced_v[stat_key] = arr[indices].tolist()
                                     else:
@@ -685,42 +657,46 @@ def write_meta_and_copy(
                         new_stats_content[k] = v
             stats["stats"] = new_stats_content
 
-        # 核心：填充到统一的 actual_max_dim
-        # 此时 stats 已经是切片过的（例如 14维 或 16维）
-        # actual_max_dim 是全局最大（例如 16维）
-        # pad_episode_stats 会把 14维的填充 0 到 16维，16维的保持不变
         pad_episode_stats(stats, from_dim=actual_max_dim, to_dim=actual_max_dim)
         aligned_episode_stats.append(stats)
 
-    # === 新增：预先计算重采样后的长度 ===
+    # === [FIX] 核心修复点 1: 重建 episode_to_frame_index 映射 ===
+    # 因为重采样后，episode长度变了，旧的映射表（基于源数据长度）已经失效
+    # 必须基于新的长度重新计算，否则 data parquet 的 index 列会错乱
     total_frames_resampled = 0
-    folder_fps_cache = {} # 缓存每个文件夹的FPS
+    folder_fps_cache = {} 
+    
+    # 新的映射表
+    new_episode_to_frame_index = {}
 
     for ep in all_episodes:
-        # 获取该 episode 的源 FPS
         src_folder = episode_source_map[ep["episode_index"]]
         if src_folder not in folder_fps_cache:
-            folder_fps_cache[src_folder] = get_info(src_folder).get("fps", fps)
+            # [FIX] 统一使用 30 作为默认值，而不是 fallback 到 target fps，确保缺少 FPS 时能触发重采样
+            folder_fps_cache[src_folder] = get_info(src_folder).get("fps", 30)
         
         src_fps = folder_fps_cache[src_folder]
         
-        # 如果需要重采样，更新 length
+        # 记录重采样后的起始帧
+        new_episode_to_frame_index[ep["episode_index"]] = total_frames_resampled
+
         if fps is not None and src_fps != fps:
-            # 模拟计算新的长度
             original_len = ep["length"]
-            # 计算简单的缩放比例 (必须与 get_resample_indices 逻辑一致)
             duration = original_len / src_fps
             new_len = int(np.ceil(duration * fps))
             ep["length"] = new_len
         
         total_frames_resampled += ep["length"]
 
-    # 更新全局的总帧数
+    # [FIX] 覆盖旧的映射表，传给 copy_data_files
+    episode_to_frame_index = new_episode_to_frame_index
+
+    # 设置总帧数为重采样后的值
     base_info["total_frames"] = total_frames_resampled
+
     save_jsonl(all_episodes, os.path.join(output_folder, "meta", "episodes.jsonl"))
     save_jsonl(aligned_episode_stats, os.path.join(output_folder, "meta", "episodes_stats.jsonl"))
 
-    # 过滤 Tasks
     used_task_indices = set()
     for episode in all_episodes:
         if "task_index" in episode:
@@ -736,14 +712,12 @@ def write_meta_and_copy(
     filtered_tasks = [t for t in all_tasks if t["task_index"] in used_task_indices]
     save_jsonl(filtered_tasks, os.path.join(output_folder, "meta", "tasks.jsonl"))
 
-    # 保存 Annotations
     os.makedirs(os.path.join(output_folder, "annotations"), exist_ok=True)
     if all_annotations:
         for key, val in all_annotations.items():
             if val:
                 save_jsonl(val, os.path.join(output_folder, "annotations", f"{key}.jsonl"))
 
-    # 合并 Stats
     stats_list = []
     for folder in source_folders:
         stats_path = os.path.join(folder, "meta", "stats.json")
@@ -752,22 +726,21 @@ def write_meta_and_copy(
                 stats_list.append(json.load(f))
     if stats_list:
         merged_stats = merge_stats(stats_list)
-        # 重新计算聚合统计，这里很重要，它会利用 actual_max_dim 进行统一
         recalc_merged_stats_with_episode_stats(merged_stats, all_stats_data, target_dim=actual_max_dim)
         if features_to_keep:
             merged_stats = {k: v for k, v in merged_stats.items() if k in features_set or k in RESERVED_FEATURES}
         with open(os.path.join(output_folder, "meta", "stats.json"), "w") as f:
             json.dump(merged_stats, f, indent=4)
 
-    # 更新 Info
     base_info["total_episodes"] = total_episodes
-    base_info["total_frames"] = total_frames
+    # [FIX] 核心修复点 2: 删除了这里覆盖 total_frames 的代码
+    # base_info["total_frames"] = total_frames <-- 删除这行，保留上面的 total_frames_resampled
+    
     base_info["total_tasks"] = len(filtered_tasks)
     base_info["total_chunks"] = (total_episodes + chunks_size - 1) // chunks_size
     base_info["splits"] = {"train": f"0:{total_episodes}"}
     base_info["fps"] = fps
     base_info["total_videos"] = total_videos
-    # 确保 info 里的 shape 是最终统一的维度
     for feature_name in ["observation.state", "action"]:
         if feature_name in base_info.get("features", {}) and "shape" in base_info["features"][feature_name]:
             base_info["features"][feature_name]["shape"] = [actual_max_dim]
@@ -775,18 +748,17 @@ def write_meta_and_copy(
     with open(os.path.join(output_folder, "meta", "info.json"), "w") as f:
         json.dump(base_info, f, indent=4)
 
-    # 复制视频和数据
     if video_keys:
+        # [FIX] 传递 fps 参数给 copy_videos
         copy_videos(source_folders, output_folder, episode_mapping, video_size=video_size, filtered_features=base_info["features"], fps=fps)
     
-    # 这里的 max_dim 必须传 actual_max_dim，确保 parquet 文件也填充到统一维度
     copy_data_files(
         source_folders=source_folders,
         output_folder=output_folder,
         episode_mapping=episode_mapping,
         max_dim=actual_max_dim, 
         fps=fps,
-        episode_to_frame_index=episode_to_frame_index,
+        episode_to_frame_index=episode_to_frame_index, # [FIX] 传入更新后的映射表
         folder_task_mapping=folder_task_mapping,
         folder_annotations_mapping=folder_annotations_mapping,
         chunks_size=chunks_size,
@@ -794,8 +766,7 @@ def write_meta_and_copy(
         remove_eef_flag=remove_eef,
         features_def=base_info["features"],
     )
-    print(f"Done: {total_episodes} episodes, {total_frames} frames, output={output_folder}")
-
+    print(f"Done: {total_episodes} episodes, {total_frames_resampled} frames (resampled), output={output_folder}")
 
 # ========= 原有函数 =========
 
@@ -1063,19 +1034,15 @@ def merge_stats(stats_list):
 def copy_videos(source_folders, output_folder, episode_mapping, video_size=None, filtered_features=None, fps=None):
     """
     从源文件夹复制视频文件到输出文件夹，保持正确的索引和结构
-    (Copy video files from source folders to output folder, maintaining correct indices and structure)
+    [FIX] 增加了 fps 参数，用于在分辨率匹配时检查帧率是否需要转换
     """
-    # Get info.json to determine video structure
     info_path = os.path.join(source_folders[0], "meta", "info.json")
     with open(info_path) as f:
         info = json.load(f)
 
     video_path_template = info["video_path"]
     
-    # === 决定扫描哪些 Video Key ===
-    # 如果传入了 filtered_features，只处理其中的 video 类型字段
     features_to_scan = filtered_features if filtered_features is not None else info.get("features", {})
-    
     video_keys = []
     for k, v in features_to_scan.items():
         if v.get("dtype") == "video":
@@ -1083,36 +1050,30 @@ def copy_videos(source_folders, output_folder, episode_mapping, video_size=None,
     
     print(f"即将复制的视频流: {video_keys}")
 
-    # Copy videos for each episode
+    # [FIX] 缓存文件夹 FPS，避免重复IO
+    folder_fps_cache = {}
+
     for old_folder, old_index, new_index in episode_mapping:
-        # Determine episode chunk (usually 0 for small datasets)
         episode_chunk = old_index // info["chunks_size"]
         new_episode_chunk = new_index // info["chunks_size"]
 
+        # [FIX] 获取源 FPS
+        if old_folder not in folder_fps_cache:
+            try:
+                with open(os.path.join(old_folder, "meta", "info.json")) as f:
+                    folder_fps_cache[old_folder] = json.load(f).get("fps", 30)
+            except:
+                folder_fps_cache[old_folder] = 30
+        src_fps = folder_fps_cache[old_folder]
+
         for video_key in video_keys:
-            # Try different possible source paths
             source_patterns = [
-                # Standard path with the episode index from metadata
-                os.path.join(
-                    old_folder,
-                    video_path_template.format(
-                        episode_chunk=episode_chunk, video_key=video_key, episode_index=old_index
-                    ),
-                ),
-                # Try with 0-based indexing
-                os.path.join(
-                    old_folder,
-                    video_path_template.format(episode_chunk=0, video_key=video_key, episode_index=0),
-                ),
-                # Try with different formatting
-                os.path.join(
-                    old_folder, f"videos/chunk-{episode_chunk:03d}/{video_key}/episode_{old_index}.mp4"
-                ),
-                # Fallback for some datasets
+                os.path.join(old_folder, video_path_template.format(episode_chunk=episode_chunk, video_key=video_key, episode_index=old_index)),
+                os.path.join(old_folder, video_path_template.format(episode_chunk=0, video_key=video_key, episode_index=0)),
+                os.path.join(old_folder, f"videos/chunk-{episode_chunk:03d}/{video_key}/episode_{old_index}.mp4"),
                 os.path.join(old_folder, f"videos/chunk-000/{video_key}/episode_000000.mp4"),
             ]
 
-            # Find the first existing source path
             source_video_path = None
             for pattern in source_patterns:
                 if os.path.exists(pattern):
@@ -1120,64 +1081,44 @@ def copy_videos(source_folders, output_folder, episode_mapping, video_size=None,
                     break
 
             if source_video_path:
-                # Construct destination path
-                dest_video_path = os.path.join(
-                    output_folder,
-                    video_path_template.format(
-                        episode_chunk=new_episode_chunk, video_key=video_key, episode_index=new_index
-                    ),
-                )
-
-                # Create destination directory if it doesn't exist
+                dest_video_path = os.path.join(output_folder, video_path_template.format(episode_chunk=new_episode_chunk, video_key=video_key, episode_index=new_index))
                 os.makedirs(os.path.dirname(dest_video_path), exist_ok=True)
 
-                # === 处理逻辑 ===
                 if video_size is not None:
                     target_w, target_h = video_size
                     need_convert = True
                     try:
-                        cmd = [
-                            "ffprobe", 
-                            "-v", "error", 
-                            "-select_streams", "v:0", 
-                            "-show_entries", "stream=width,height", 
-                            "-of", "csv=s=x:p=0", 
-                            source_video_path
-                        ]
+                        cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", source_video_path]
                         output = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode("utf-8").strip()
                         if output:
                             parts = output.split('x')
                             if len(parts) == 2:
                                 w, h = int(parts[0]), int(parts[1])
-                                if w == target_w and h == target_h:
+                                # [FIX] 核心修复：只有当分辨率一致 且 FPS 不需要转换时，才跳过
+                                fps_match = (fps is None) or (abs(src_fps - fps) < 1e-5)
+                                if w == target_w and h == target_h and fps_match:
                                     need_convert = False
-                                    print(f"Skipping convert (size match {w}x{h}): {source_video_path} -> Copying...")
+                                    print(f"Skipping convert (size match {w}x{h}, fps match): {source_video_path} -> Copying...")
+                                elif w == target_w and h == target_h and not fps_match:
+                                    print(f"Force convert (FPS change {src_fps}->{fps}): {source_video_path}")
                                     
                     except Exception as e:
                         print(f"Check video size failed: {e}, will force convert.")
-                        # 失败时回退到直接复制
                         need_convert = True
+                    
                     if need_convert:
-                        print(f"Processing video (Resize/Pad): {source_video_path} -> {dest_video_path}")
                         try:
+                            # [FIX] 确保传入 target_fps
                             process_video_pad(source_video_path, dest_video_path, target_w, target_h, target_fps=fps)
                         except Exception as e:
                             print(f"Error processing video {source_video_path}: {e}")
                             shutil.copy2(source_video_path, dest_video_path)
                     else:
-                        # 直接复制，速度极快
                         shutil.copy2(source_video_path, dest_video_path)
-
-
                 else:
-                    # 原有逻辑：直接复制
                     shutil.copy2(source_video_path, dest_video_path)
             else:
-                # === 修改点：删除了原来的递归搜索 (os.walk) ===
-                # 如果标准路径找不到，直接报警告，不进行模糊搜索
-                print(
-                    f"Warning: Video file not found for {video_key}, episode {old_index} in {old_folder}"
-                )
+                print(f"Warning: Video file not found for {video_key}, episode {old_index} in {old_folder}")
 
 def validate_timestamps(source_folders, tolerance_s=1e-4):
     """
@@ -1278,6 +1219,7 @@ def copy_data_files(
 ):
     """
     复制并处理parquet数据文件，使用 Pyarrow 强制执行严格的 Schema 类型转换
+    [FIX] 增加了强制重写 timestamp 的逻辑，解决训练时的 diff 报错
     """
     if fps is None:
         info_path = os.path.join(source_folders[0], "meta", "info.json")
@@ -1295,59 +1237,36 @@ def copy_data_files(
     
     RESERVED_COLUMNS = SYSTEM_RESERVED_FIELDS
 
-    # === 1. 构建 Pyarrow Schema (基于 features_def 和 LeRobot 规范) ===
-    # 这是解决类型不匹配的核心
     def _build_pyarrow_schema(df_columns, features_def):
         fields = []
         for col in df_columns:
-            # 默认类型
             pa_type = pa.string()
-            
-            # --- 索引类 (强制 int64) ---
             if col in ["frame_index", "episode_index", "index", "task_index"]:
                 pa_type = pa.int64()
-            
-            # --- 时间戳 (强制 float32) ---
             elif col == "timestamp":
                 pa_type = pa.float32()
-            
-            # --- 特征定义匹配 ---
             elif features_def and col in features_def:
                 feat = features_def[col]
                 dtype = feat.get("dtype")
                 shape = feat.get("shape")
-                
-                # 处理 float32 向量 (state, action)
                 if dtype == "float32":
-                    if shape and (len(shape) > 0 and shape != [1]): # 向量
+                    if shape and (len(shape) > 0 and shape != [1]):
                         pa_type = pa.list_(pa.float32())
-                    else: # 标量
+                    else:
                         pa_type = pa.float32()
-                        
-                # 处理 int32 向量/标量 (Annotations)
                 elif dtype == "int32":
-                    # 注意：如果 features_def 说它是 video，但这里出现在 parquet 里，那可能是 path 字符串，这里主要处理数值
-                    if shape and (len(shape) > 0 and shape != [1]): # 向量
+                    if shape and (len(shape) > 0 and shape != [1]):
                         pa_type = pa.list_(pa.int32())
-                    else: # 标量
+                    else:
                         pa_type = pa.int32()
-                        
-                # 处理图像路径等字符串
                 elif dtype == "video" or dtype == "string":
                     pa_type = pa.string()
-            
-            # --- 兜底逻辑 (如果 features_def 没覆盖到) ---
             else:
-                # 典型的 Annotation 列表推测为 int32 列表
                 if "annotation" in col or "gripper" in col or "eef" in col:
-                     # 简单判断：如果是 state/action 相关且不是 float，可能是 int32 列表
                      pa_type = pa.list_(pa.int32())
-            
             fields.append((col, pa_type))
-        
         return pa.schema(fields)
 
-    # === 内部工具：过滤列 ===
     def _filter_columns(dataframe):
         if features_to_keep:
             cols_to_retain = set(features_to_keep)
@@ -1386,25 +1305,24 @@ def copy_data_files(
         if source_path:
             try:
                 df = pd.read_parquet(source_path)
-                # === 新增：帧率重采样 (最小化漂移核心逻辑) ===
-                # 1. 获取源 FPS
                 src_info = get_info(old_folder)
                 src_fps = src_info.get("fps", default_fps)
                 
-                # 2. 计算需要保留的索引
-                # fps 是传入的目标 FPS (arg: fps)
+                # 1. 重采样
                 if fps is not None and src_fps != fps:
-                    # 使用上面定义的工具函数
                     indices = get_resample_indices(len(df), src_fps, fps)
                     if indices is not None and len(indices) > 0:
-                        # 核心：按索引切片
                         df = df.iloc[indices]
-                        # 重置索引，防止 frame_index 不连续
                         df.reset_index(drop=True, inplace=True)
-                    # ==========================================
+                
+                # [FIX] 2. 强制重写时间戳
+                # 消除源数据的采集抖动和重采样带来的浮点误差，确保 timestamp 严格对齐
+                if "timestamp" in df.columns and fps is not None and fps > 0:
+                    df["timestamp"] = (np.arange(len(df), dtype=np.float64) / fps).astype(np.float32)
+
                 df = _filter_columns(df)
                 
-                # 剔除 EEF
+                # 3. 移除 EEF
                 if remove_eef_flag:
                     if old_folder not in folder_meta_cache:
                         src_info = get_info(old_folder)
@@ -1420,7 +1338,7 @@ def copy_data_files(
                                     if isinstance(x, (list, np.ndarray)) and len(x) >= len(original_names) else x
                                 )
 
-                # 维度填充
+                # 4. 维度 Padding
                 for feature in ["observation.state", "action"]:
                     if feature in df.columns:
                         first_val = df[feature].dropna().iloc[0] if not df[feature].dropna().empty else None
@@ -1430,7 +1348,6 @@ def copy_data_files(
                                 if x is not None and isinstance(x, (list, np.ndarray)) and len(x) < max_dim else x
                             )
 
-                # 更新索引
                 if "episode_index" in df.columns:
                     df["episode_index"] = new_index
 
@@ -1441,13 +1358,11 @@ def copy_data_files(
                         first_index = new_index * len(df)
                     df["index"] = [first_index + i for i in range(len(df))]
 
-                # 更新 Task Index
                 if "task_index" in df.columns and folder_task_mapping and old_folder in folder_task_mapping:
                     current_task_index = df["task_index"].iloc[0]
                     if current_task_index in folder_task_mapping[old_folder]:
                         df["task_index"] = folder_task_mapping[old_folder][current_task_index]
 
-                # 更新 Annotation 映射
                 if folder_annotations_mapping and old_folder in folder_annotations_mapping:
                     ann_map = folder_annotations_mapping[old_folder]
                     
@@ -1465,7 +1380,6 @@ def copy_data_files(
                                     lambda x: ann_map[mapping_key].get(int(x), int(x)) if pd.notnull(x) else x
                                 )
 
-                    # 应用映射
                     mapping_configs = [
                         ("subtask_annotation", "subtask_annotation"),
                         ("scene_annotation", "scene_annotation"),
@@ -1478,8 +1392,6 @@ def copy_data_files(
                     for col, key in mapping_configs:
                         apply_map(col, key)
                 
-                # === 标量修正 (Flatten Scalars) ===
-                # 这一步必须在转 Table 之前做，确保数据形状正确
                 scalar_candidates = ["scene_annotation", "task_index", "frame_index", "episode_index", "index"]
                 for col in df.columns:
                     should_flatten = False
@@ -1495,17 +1407,12 @@ def copy_data_files(
                         if isinstance(first_val, (list, np.ndarray)):
                              df[col] = df[col].apply(lambda x: x[0] if isinstance(x, (list, np.ndarray)) and len(x) > 0 else (x if x is not None else 0))
 
-                # === 2. 转换为 Pyarrow Table 并强制转换类型 ===
-                # 构建目标 Schema
                 target_schema = _build_pyarrow_schema(df.columns, features_def)
                 
-                # 将 Pandas DF 转为 Table，并应用 Schema
-                # 这会自动处理 float64->float32, int64->int32 等转换
                 try:
                     table = pa.Table.from_pandas(df, schema=target_schema, preserve_index=False)
                 except Exception as cast_err:
                     print(f"Pyarrow casting error in {source_path}: {cast_err}")
-                    # 如果自动转换失败（例如 list<double> -> list<float32> 有时会报错），尝试手动 numpy 转换后再转 table
                     for col in df.columns:
                         if target_schema.field(col).type == pa.float32():
                             df[col] = df[col].astype("float32")
@@ -1513,10 +1420,8 @@ def copy_data_files(
                             df[col] = df[col].astype("int64")
                         elif target_schema.field(col).type == pa.int32():
                             df[col] = df[col].astype("int32")
-                    # 再次尝试
                     table = pa.Table.from_pandas(df, schema=target_schema, preserve_index=False)
 
-                # 3. 保存
                 chunk_index = new_index // chunks_size
                 chunk_dir = os.path.join(output_folder, "data", f"chunk-{chunk_index:03d}")
                 os.makedirs(chunk_dir, exist_ok=True)
