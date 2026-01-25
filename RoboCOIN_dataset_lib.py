@@ -7,6 +7,91 @@ import traceback
 import numpy as np
 import pandas as pd
 import cv2
+
+# ================= [新增代码 Start] =================
+import re
+
+# 1. 定义标准目标列名 (固定 16 维)
+TARGET_NAMES = []
+for side in ["left", "right"]:
+    for i in range(1, 8):
+        TARGET_NAMES.append(f"{side}_arm_joint_{i}_rad")
+    TARGET_NAMES.append(f"{side}_gripper_open")
+
+# 2. 辅助函数：提取关节索引
+def get_joint_index(name, pattern):
+    match = re.search(pattern, name)
+    if match: return int(match.group(1))
+    return None
+
+# 3. 核心函数：生成标准化映射指令
+def get_standardized_mapping(source_names):
+    if not source_names: return None, []
+    
+    # 临时存储找到的索引
+    found_indices = {"left": {"arm": {}, "grip": [], "hand": {}}, "right": {"arm": {}, "grip": [], "hand": {}}}
+
+    for idx, name in enumerate(source_names):
+        n = name.lower()
+        if any(kw in n for kw in ["pos", "quat", "euler", "matrix", "pose", "eef"]): continue
+        side = "left" if "left" in n else ("right" if "right" in n else None)
+        if not side: continue
+
+        if "arm_joint" in n:
+            if (num := get_joint_index(n, r"joint_(\d+)")) is not None: found_indices[side]["arm"][num] = idx
+        elif any(kw in n for kw in ["gripper_open", "gripper_width", "gripper_state"]):
+            found_indices[side]["grip"].append(idx)
+        elif "hand_joint" in n:
+            if (num := get_joint_index(n, r"joint_(\d+)")) is not None: found_indices[side]["hand"][num] = idx
+
+    mapping_instructions = []
+    for side in ["left", "right"]:
+        # 机械臂 1-7 (缺的补0)
+        arm_map = found_indices[side]["arm"]
+        for i in range(1, 8):
+            mapping_instructions.append({"type": "direct", "index": arm_map[i]} if i in arm_map else {"type": "pad_zero"})
+        
+        # 夹爪 (优先用显式gripper，没有则用灵巧手 joint2+3 合成)
+        grip_list, hand_map = found_indices[side]["grip"], found_indices[side]["hand"]
+        if grip_list:
+            mapping_instructions.append({"type": "direct", "index": grip_list[0]})
+        elif 2 in hand_map and 3 in hand_map:
+            mapping_instructions.append({"type": "sum", "indices": [hand_map[2], hand_map[3]]})
+        elif 2 in hand_map:
+            mapping_instructions.append({"type": "direct", "index": hand_map[2]})
+        else:
+            mapping_instructions.append({"type": "pad_zero"})
+
+    return mapping_instructions, TARGET_NAMES
+
+# 4. 辅助函数：应用映射到向量
+def apply_mapping_to_vector(original_vector, mapping_instructions):
+    if original_vector is None: return [0.0] * 16
+    vec = original_vector.tolist() if isinstance(original_vector, np.ndarray) else (original_vector if isinstance(original_vector, list) else [])
+    vec_len = len(vec)
+    new_data = []
+    for instr in mapping_instructions:
+        if instr["type"] == "direct":
+            new_data.append(vec[instr["index"]] if instr["index"] < vec_len else 0.0)
+        elif instr["type"] == "pad_zero":
+            new_data.append(0.0)
+        elif instr["type"] == "sum":
+            val = sum(vec[idx] for idx in instr["indices"] if idx < vec_len)
+            new_data.append(val)
+    return new_data
+
+# 5. 辅助函数：应用映射到统计信息
+def apply_mapping_to_stats(original_stats, mapping_instructions):
+    new_stats = {}
+    for key in ["min", "max", "mean", "std"]:
+        if key not in original_stats: continue
+        old_vals = original_stats[key]
+        if not isinstance(old_vals, list): continue
+        new_stats[key] = apply_mapping_to_vector(old_vals, mapping_instructions)
+    if "count" in original_stats: new_stats["count"] = original_stats["count"]
+    return new_stats
+# ================= [新增代码 End] =================
+
 # 全局保留字段列表
 SYSTEM_RESERVED_FIELDS = [
     "episode_index", "frame_index", "timestamp", "index", "task_index", 
@@ -524,6 +609,7 @@ def write_meta_and_copy(
     video_size=None,
     remove_eef=False
 ):
+
     os.makedirs(output_folder, exist_ok=True)
     os.makedirs(os.path.join(output_folder, "meta"), exist_ok=True)
 
@@ -536,41 +622,29 @@ def write_meta_and_copy(
     
     for folder in source_folders:
         current_info = get_info(folder)
-        current_indices = {}
+        folder_mapping_instructions[folder] = {} # 初始化
+        
         if remove_eef:
+            # [修改] 使用新的 get_standardized_mapping
             for feat in ["observation.state", "action"]:
                 if feat in current_info.get("features", {}):
                     names = current_info["features"][feat].get("names", [])
-                    indices = []
-                    kept_names = []
-                    if names:
-                        indices, kept_names = get_safe_indices(names)
-                    else:
-                        shape = current_info["features"][feat].get("shape", [0])
-                        indices = list(range(shape[0]))
-                        kept_names = [f"dim_{i}" for i in indices]
+                    mapping_instr, _ = get_standardized_mapping(names)
+                    if mapping_instr:
+                        folder_mapping_instructions[folder][feat] = mapping_instr
 
-                    current_indices[feat] = indices
-                    sliced_dim = len(indices)
-                    if feat not in global_max_dims_map or sliced_dim > global_max_dims_map[feat]:
-                        global_max_dims_map[feat] = sliced_dim
-                        max_dim_source_folder[feat] = folder
-        folder_indices_map[folder] = current_indices
-
-    detected_max_dim = 0
-    if global_max_dims_map:
-        detected_max_dim = max(global_max_dims_map.values())
-    
-    original_max_dim = max_dim_cli or max(folder_dimensions.values())
-    
-    if detected_max_dim > 0:
-        if max_dim_cli:
-            actual_max_dim = max(max_dim_cli, detected_max_dim)
-        else:
-            actual_max_dim = detected_max_dim
-        print(f"!!! 全局维度对齐: 检测到最大切片维度 {detected_max_dim}, 最终设定为 {actual_max_dim} !!!")
+    # [修改] 强制最大维度为 16
+    actual_max_dim = 16 
+    if remove_eef:
+        print(f"!!! 强制标准化维度: 16 (Left:7+1, Right:7+1) !!!")
+        # 更新 info.json 的 names
+        for feat in ["observation.state", "action"]:
+            if feat in base_info.get("features", {}):
+                base_info["features"][feat]["shape"] = [actual_max_dim]
+                base_info["features"][feat]["names"] = TARGET_NAMES
     else:
-        actual_max_dim = max_dim_cli or original_max_dim
+        actual_max_dim = max_dim_cli or max(folder_dimensions.values())
+
 
     if remove_eef:
         for feat in ["observation.state", "action"]:
@@ -625,7 +699,7 @@ def write_meta_and_copy(
             ep_idx = stats.get("episode_index")
             source_folder = episode_source_map.get(ep_idx)
             current_folder_indices = folder_indices_map.get(source_folder, {})
-
+            current_mappings = folder_mapping_instructions.get(source_folder, {})
             new_stats_content = {}
             for k, v in current_stats.items():
                 keep = False
@@ -637,23 +711,11 @@ def write_meta_and_copy(
                     pass 
                 
                 if keep:
-                    if k in current_folder_indices:
-                        indices = current_folder_indices[k]
-                        sliced_v = {}
-                        for stat_key, stat_val in v.items():
-                            if stat_key in ["min", "max", "mean", "std"] and isinstance(stat_val, list):
-                                try:
-                                    arr = np.array(stat_val)
-                                    if len(arr) > len(indices) or (arr.ndim > 0 and arr.shape[0] >= len(indices)):
-                                         sliced_v[stat_key] = arr[indices].tolist()
-                                    else:
-                                         sliced_v[stat_key] = stat_val
-                                except Exception:
-                                    sliced_v[stat_key] = stat_val
-                            else:
-                                sliced_v[stat_key] = stat_val
-                        new_stats_content[k] = sliced_v
+                    # [修改] 如果是 state/action 且有映射指令，应用新函数
+                    if remove_eef and k in ["observation.state", "action"] and k in current_mappings:
+                        new_stats_content[k] = apply_mapping_to_stats(v, current_mappings[k])
                     else:
+                        # 旧的切片逻辑或原样保留
                         new_stats_content[k] = v
             stats["stats"] = new_stats_content
 
@@ -1215,7 +1277,8 @@ def copy_data_files(
     default_fps=30,
     features_to_keep=None,
     remove_eef_flag=False,
-    features_def=None
+    features_def=None,
+    folder_mapping_instructions=None
 ):
     """
     复制并处理parquet数据文件，使用 Pyarrow 强制执行严格的 Schema 类型转换
@@ -1322,7 +1385,18 @@ def copy_data_files(
 
                 df = _filter_columns(df)
                 
-                # 3. 移除 EEF
+                # 3. 移# ================= [新增代码 Start] =================
+                # 应用标准化映射 (如果有指令)
+                mapping_applied = False # [新增标记]
+                if folder_mapping_instructions:
+                    mappings = folder_mapping_instructions.get(old_folder, {})
+                    for feat in ["observation.state", "action"]:
+                        if feat in df.columns and feat in mappings:
+                            instr = mappings[feat]
+                            # 逐行应用转换
+                            df[feat] = df[feat].apply(lambda x: apply_mapping_to_vector(x, instr))
+                            mapping_applied = True
+                # ================= [新增代码 End] =================除 EEF
                 if remove_eef_flag:
                     if old_folder not in folder_meta_cache:
                         src_info = get_info(old_folder)
@@ -1515,371 +1589,246 @@ def pad_parquet_data(source_path, target_path, original_dim=14, target_dim=18):
     return new_df
 
 
-def merge_datasets(
-    source_folders, output_folder, validate_ts=False, tolerance_s=1e-4, max_dim=18, default_fps=20
+def write_meta_and_copy(
+    source_folders,
+    output_folder,
+    episode_mapping,
+    all_episodes,
+    all_episodes_stats,
+    folder_dimensions,
+    folder_task_mapping,
+    folder_annotations_mapping,
+    episode_to_frame_index, # 注意：这是基于原始长度的旧映射，下面会重新计算
+    all_stats_data,
+    all_tasks,
+    all_annotations,
+    total_frames,
+    max_dim_cli,
+    fps,
+    features_to_keep=None,
+    video_size=None,
+    remove_eef=False
 ):
-    """
-    将多个数据集文件夹合并为一个，处理索引、维度和元数据
-    (Merge multiple dataset folders into one, handling indices, dimensions, and metadata)
 
-    Args:
-        source_folders (list): 源数据集文件夹路径列表 (List of source dataset folder paths)
-        output_folder (str): 输出文件夹路径 (Output folder path)
-        validate_ts (bool): 是否验证时间戳 (Whether to validate timestamps)
-        tolerance_s (float): 时间戳不连续性的容差值，以秒为单位 (Tolerance for timestamp discontinuities in seconds)
-        max_dim (int): 向量的最大维度 (Maximum dimension for vectors)
-        default_fps (float): 默认帧率 (Default frame rate)
-
-    这个函数执行以下操作:
-    (This function performs the following operations:)
-    1. 合并所有的episodes、tasks和stats (Merges all episodes, tasks and stats)
-    2. 重新编号所有的索引以保持连续性 (Renumbers all indices to maintain continuity)
-    3. 填充向量维度使其一致 (Pads vector dimensions for consistency)
-    4. 更新元数据文件 (Updates metadata files)
-    5. 复制并处理数据和视频文件 (Copies and processes data and video files)
-    """
-    # Create output folder if it doesn't exist
     os.makedirs(output_folder, exist_ok=True)
     os.makedirs(os.path.join(output_folder, "meta"), exist_ok=True)
 
-    # 使用默认FPS
-    fps = default_fps
-    print(f"使用默认FPS值: {fps}")
+    episode_source_map = {new_idx: folder for folder, _, new_idx in episode_mapping}
+    folder_indices_map = {} 
+    global_max_dims_map = {} 
+    max_dim_source_folder = {} 
+    
+    # [修复] 必须在这里初始化，否则下面循环会报错
+    folder_mapping_instructions = {} 
 
-    # Load episodes from all source folders
-    all_episodes = []
-    all_episodes_stats = []
-    all_tasks = []
-
-    total_frames = 0
-    total_episodes = 0
-
-    # Keep track of episode mapping (old_folder, old_index, new_index)
-    episode_mapping = []
-
-    # Collect all stats for proper merging
-    all_stats_data = []
-
-    # Track dimensions for each folder
-    folder_dimensions = {}
-
-    # 累积帧数与帧索引映射
-    cumulative_frame_count = 0
-    episode_to_frame_index = {}
-
-    # 任务映射相关
-    task_desc_to_new_index = {}
-    folder_task_mapping = {}
-    all_unique_tasks = []
-
-    # 从info.json获取chunks_size
-    info_path = os.path.join(source_folders[0], "meta", "info.json")
-    chunks_size = 1000  # 默认值
-    if os.path.exists(info_path):
-        with open(info_path) as f:
-            info_first = json.load(f)
-            chunks_size = info_first.get("chunks_size", 1000)
-
-    # 使用更简单的方法计算视频总数 (Use simpler method to calculate total videos)
-    total_videos = 0
-
+    base_info = get_info(source_folders[0])
+    
     for folder in source_folders:
-        try:
-            # 从每个数据集的info.json直接获取total_videos
-            folder_info_path = os.path.join(folder, "meta", "info.json")
-            if os.path.exists(folder_info_path):
-                with open(folder_info_path) as f:
-                    folder_info = json.load(f)
-                    if "total_videos" in folder_info:
-                        folder_videos = folder_info["total_videos"]
-                        total_videos += folder_videos
-                        print(
-                            f"从{folder}的info.json中读取到视频数量: {folder_videos} (Read video count from {folder}'s info.json: {folder_videos})"
-                        )
+        current_info = get_info(folder)
+        folder_mapping_instructions[folder] = {} # 初始化
+        
+        if remove_eef:
+            # [修改] 使用新的 get_standardized_mapping
+            for feat in ["observation.state", "action"]:
+                if feat in current_info.get("features", {}):
+                    names = current_info["features"][feat].get("names", [])
+                    mapping_instr, _ = get_standardized_mapping(names)
+                    if mapping_instr:
+                        folder_mapping_instructions[folder][feat] = mapping_instr
 
-            # 检测维度
-            folder_dim = max_dim
-            for root, _dirs, files in os.walk(folder):
-                for file in files:
-                    if file.endswith(".parquet"):
-                        try:
-                            df = pd.read_parquet(os.path.join(root, file))
-                            if "observation.state" in df.columns:
-                                first_state = df["observation.state"].iloc[0]
-                                if isinstance(first_state, (list, np.ndarray)):
-                                    folder_dim = len(first_state)
-                                    print(f"Detected {folder_dim} dimensions in {folder}")
-                                    break
-                        except Exception as e:
-                            print(f"Error checking dimensions in {folder}: {e}")
-                        break
-                if folder_dim != max_dim:
-                    break
-            folder_dimensions[folder] = folder_dim
+    # [修改] 强制最大维度为 16
+    actual_max_dim = 16 
+    if remove_eef:
+        print(f"!!! 强制标准化维度: 16 (Left:7+1, Right:7+1) !!!")
+        # 更新 info.json 的 names
+        for feat in ["observation.state", "action"]:
+            if feat in base_info.get("features", {}):
+                base_info["features"][feat]["shape"] = [actual_max_dim]
+                base_info["features"][feat]["names"] = TARGET_NAMES
+    else:
+        actual_max_dim = max_dim_cli or max(folder_dimensions.values())
 
-            # 加载episodes
-            episodes_path = os.path.join(folder, "meta", "episodes.jsonl")
-            if not os.path.exists(episodes_path):
-                print(f"Warning: Episodes file not found in {folder}, skipping")
-                continue
-            episodes = load_jsonl(episodes_path)
+    if remove_eef:
+        for feat in ["observation.state", "action"]:
+            if feat in global_max_dims_map:
+                if feat not in base_info["features"]:
+                    continue 
 
-            # 加载episode stats
-            episodes_stats_path = os.path.join(folder, "meta", "episodes_stats.jsonl")
-            episodes_stats = []
-            if os.path.exists(episodes_stats_path):
-                episodes_stats = load_jsonl(episodes_stats_path)
+                base_info["features"][feat]["shape"] = [actual_max_dim]
+                
+                src_folder = max_dim_source_folder.get(feat)
+                if src_folder:
+                    src_info = get_info(src_folder)
+                    src_names = src_info["features"][feat].get("names", [])
+                    if src_names:
+                        _, kept_names = get_safe_indices(src_names)
+                        if len(kept_names) < actual_max_dim:
+                            kept_names += [f"pad_{i}" for i in range(len(kept_names), actual_max_dim)]
+                        base_info["features"][feat]["names"] = kept_names
 
-            # 创建映射 episode_index -> stats
-            stats_map = {}
-            for stat in episodes_stats:
-                if "episode_index" in stat:
-                    stats_map[stat["episode_index"]] = stat
+    RESERVED_FEATURES = SYSTEM_RESERVED_FIELDS
+    if features_to_keep:
+        print(f"筛选特定字段: {features_to_keep}")
+        original_features = base_info.get("features", {})
+        filtered_features = {}
+        all_wanted = set(features_to_keep) | set(RESERVED_FEATURES)
+        for feat in all_wanted:
+            if feat in original_features:
+                feat_def = original_features[feat].copy()
+                if feat_def.get("dtype") == "video" and video_size is not None:
+                    tw, th = video_size
+                    feat_def["shape"] = [th, tw, 3]
+                    if "info" in feat_def:
+                        feat_def["info"] = feat_def["info"].copy()
+                        feat_def["info"]["video.width"] = tw
+                        feat_def["info"]["video.height"] = th
+                filtered_features[feat] = feat_def
+        base_info["features"] = filtered_features
+        video_keys = [k for k in get_video_keys({"features": filtered_features})]
+    else:
+        video_keys = get_video_keys(base_info)
+    
+    chunks_size = get_chunks_size(base_info)
+    total_episodes = len(all_episodes)
+    total_videos = len(video_keys) * total_episodes
 
-            # 加载tasks并构建映射
-            tasks_path = os.path.join(folder, "meta", "tasks.jsonl")
-            folder_tasks = []
-            if os.path.exists(tasks_path):
-                folder_tasks = load_jsonl(tasks_path)
+    aligned_episode_stats = []
+    features_set = set(features_to_keep) if features_to_keep else None
 
-            folder_task_mapping[folder] = {}
-            for task in folder_tasks:
-                task_desc = task["task"]
-                old_index = task["task_index"]
-                if task_desc not in task_desc_to_new_index:
-                    new_index = len(all_unique_tasks)
-                    task_desc_to_new_index[task_desc] = new_index
-                    all_unique_tasks.append({"task_index": new_index, "task": task_desc})
-                folder_task_mapping[folder][old_index] = task_desc_to_new_index[task_desc]
+    for stats in all_episodes_stats:
+        if "stats" in stats:
+            current_stats = stats["stats"]
+            ep_idx = stats.get("episode_index")
+            source_folder = episode_source_map.get(ep_idx)
+            current_folder_indices = folder_indices_map.get(source_folder, {})
+            current_mappings = folder_mapping_instructions.get(source_folder, {})
+            new_stats_content = {}
+            for k, v in current_stats.items():
+                keep = False
+                if features_set is None:
+                    keep = True
+                elif k in features_set or k in RESERVED_FEATURES:
+                    keep = True
+                else:
+                    pass 
+                
+                if keep:
+                    # [修改] 如果是 state/action 且有映射指令，应用新函数
+                    if remove_eef and k in ["observation.state", "action"] and k in current_mappings:
+                        new_stats_content[k] = apply_mapping_to_stats(v, current_mappings[k])
+                    else:
+                        # 旧的切片逻辑或原样保留
+                        new_stats_content[k] = v
+            stats["stats"] = new_stats_content
 
-            # 处理episodes
-            for episode in episodes:
-                old_index = episode["episode_index"]
-                # 新增：完整的episode处理与统计累积
-                new_index = total_episodes
-                episode["episode_index"] = new_index
-                all_episodes.append(episode)
+        pad_episode_stats(stats, from_dim=actual_max_dim, to_dim=actual_max_dim)
+        aligned_episode_stats.append(stats)
 
-                # 更新对应的episode统计（如存在）
-                if old_index in stats_map:
-                    stats = stats_map[old_index]
-                    stats["episode_index"] = new_index
+    # === [FIX] 核心修复点 1: 重建 episode_to_frame_index 映射 ===
+    # 因为重采样后，episode长度变了，旧的映射表（基于源数据长度）已经失效
+    # 必须基于新的长度重新计算，否则 data parquet 的 index 列会错乱
+    total_frames_resampled = 0
+    folder_fps_cache = {} 
+    
+    # 新的映射表
+    new_episode_to_frame_index = {}
 
-                    # Pad stats data if needed
-                    if "stats" in stats and folder_dimensions[folder] < max_dim:  # 使用变量替代硬编码的18
-                        # Pad observation.state and action stats
-                        for feature in ["observation.state", "action"]:
-                            if feature in stats["stats"]:
-                                for stat_type in ["mean", "std", "max", "min"]:
-                                    if stat_type in stats["stats"][feature]:
-                                        # Get current values
-                                        values = stats["stats"][feature][stat_type]
+    for ep in all_episodes:
+        src_folder = episode_source_map[ep["episode_index"]]
+        if src_folder not in folder_fps_cache:
+            # [FIX] 统一使用 30 作为默认值，而不是 fallback 到 target fps，确保缺少 FPS 时能触发重采样
+            folder_fps_cache[src_folder] = get_info(src_folder).get("fps", 30)
+        
+        src_fps = folder_fps_cache[src_folder]
+        
+        # 记录重采样后的起始帧
+        new_episode_to_frame_index[ep["episode_index"]] = total_frames_resampled
 
-                                        # Check if it's a list/array that needs padding
-                                        if (
-                                            isinstance(values, list) and len(values) < max_dim
-                                        ):  # 使用变量替代硬编码的18
-                                            # Pad with zeros
-                                            padded = values + [0.0] * (
-                                                max_dim - len(values)
-                                            )  # 使用变量替代硬编码的18
-                                            stats["stats"][feature][stat_type] = padded
+        if fps is not None and src_fps != fps:
+            original_len = ep["length"]
+            duration = original_len / src_fps
+            new_len = int(np.ceil(duration * fps))
+            ep["length"] = new_len
+        
+        total_frames_resampled += ep["length"]
 
-                    all_episodes_stats.append(stats)
+    # [FIX] 覆盖旧的映射表，传给 copy_data_files
+    episode_to_frame_index = new_episode_to_frame_index
 
-                    # Add to all_stats_data for proper merging
-                    if "stats" in stats:
-                        all_stats_data.append(stats["stats"])
+    # 设置总帧数为重采样后的值
+    base_info["total_frames"] = total_frames_resampled
 
-                # Add to mapping
-                episode_mapping.append((folder, old_index, new_index))
-
-                # Update counters
-                total_episodes += 1
-                total_frames += episode["length"]
-
-                # 处理每个episode时收集此信息
-                episode_to_frame_index[new_index] = cumulative_frame_count
-                cumulative_frame_count += episode["length"]
-
-            # 使用收集的唯一任务列表替换之前的任务处理逻辑
-            all_tasks = all_unique_tasks
-
-        except Exception as e:
-            print(f"Error processing folder {folder}: {e}")
-            continue
-
-    print(f"Processed {total_episodes} episodes from {len(source_folders)} folders")
-
-    # Save combined episodes and stats
     save_jsonl(all_episodes, os.path.join(output_folder, "meta", "episodes.jsonl"))
-    save_jsonl(all_episodes_stats, os.path.join(output_folder, "meta", "episodes_stats.jsonl"))
-    save_jsonl(all_tasks, os.path.join(output_folder, "meta", "tasks.jsonl"))
+    save_jsonl(aligned_episode_stats, os.path.join(output_folder, "meta", "episodes_stats.jsonl"))
 
-    # Merge and save stats
+    used_task_indices = set()
+    for episode in all_episodes:
+        if "task_index" in episode:
+            used_task_indices.add(episode["task_index"])
+    if not used_task_indices:
+        for stats in aligned_episode_stats:
+            if "stats" in stats and "task_index" in stats["stats"]:
+                task_idx_info = stats["stats"]["task_index"]
+                if isinstance(task_idx_info, dict) and "min" in task_idx_info:
+                    used_task_indices.add(int(task_idx_info["min"][0]))
+                else:
+                    used_task_indices.add(int(task_idx_info))
+    filtered_tasks = [t for t in all_tasks if t["task_index"] in used_task_indices]
+    save_jsonl(filtered_tasks, os.path.join(output_folder, "meta", "tasks.jsonl"))
+
+    os.makedirs(os.path.join(output_folder, "annotations"), exist_ok=True)
+    if all_annotations:
+        for key, val in all_annotations.items():
+            if val:
+                save_jsonl(val, os.path.join(output_folder, "annotations", f"{key}.jsonl"))
+
     stats_list = []
     for folder in source_folders:
         stats_path = os.path.join(folder, "meta", "stats.json")
         if os.path.exists(stats_path):
             with open(stats_path) as f:
-                stats = json.load(f)
-                stats_list.append(stats)
-
+                stats_list.append(json.load(f))
     if stats_list:
-        # Merge global stats
         merged_stats = merge_stats(stats_list)
-
-        # Update merged stats with episode-specific stats if available
-        if all_stats_data:
-            # For each feature in the stats
-            for feature in merged_stats:
-                if feature in all_stats_data[0]:
-                    # Recalculate statistics based on all episodes
-                    values = [stat[feature] for stat in all_stats_data if feature in stat]
-
-                    # Find the maximum dimension for this feature
-                    max_dim = max(
-                        len(np.array(val.get("mean", [0])).flatten()) for val in values if "mean" in val
-                    )
-
-                    # Update count
-                    if "count" in merged_stats[feature]:
-                        merged_stats[feature]["count"] = [
-                            sum(stat.get("count", [0])[0] for stat in values if "count" in stat)
-                        ]
-
-                    # Update min/max with padding
-                    if "min" in merged_stats[feature] and all("min" in stat for stat in values):
-                        # Pad min values
-                        padded_mins = []
-                        for val in values:
-                            val_array = np.array(val["min"])
-                            val_flat = val_array.flatten()
-                            if len(val_flat) < max_dim:
-                                padded = np.zeros(max_dim)
-                                padded[: len(val_flat)] = val_flat
-                                padded_mins.append(padded)
-                            else:
-                                padded_mins.append(val_flat)
-                        merged_stats[feature]["min"] = np.minimum.reduce(padded_mins).tolist()
-
-                    if "max" in merged_stats[feature] and all("max" in stat for stat in values):
-                        # Pad max values
-                        padded_maxs = []
-                        for val in values:
-                            val_array = np.array(val["max"])
-                            val_flat = val_array.flatten()
-                            if len(val_flat) < max_dim:
-                                padded = np.zeros(max_dim)
-                                padded[: len(val_flat)] = val_flat
-                                padded_maxs.append(padded)
-                            else:
-                                padded_maxs.append(val_flat)
-                        merged_stats[feature]["max"] = np.maximum.reduce(padded_maxs).tolist()
-
-                    # Update mean and std (weighted by count if available)
-                    if "mean" in merged_stats[feature] and all("mean" in stat for stat in values):
-                        # Pad mean values
-                        padded_means = []
-                        for val in values:
-                            val_array = np.array(val["mean"])
-                            val_flat = val_array.flatten()
-                            if len(val_flat) < max_dim:
-                                padded = np.zeros(max_dim)
-                                padded[: len(val_flat)] = val_flat
-                                padded_means.append(padded)
-                            else:
-                                padded_means.append(val_flat)
-
-                        if all("count" in stat for stat in values):
-                            counts = [stat["count"][0] for stat in values]
-                            total_count = sum(counts)
-                            weighted_means = [
-                                mean * count / total_count
-                                for mean, count in zip(padded_means, counts, strict=False)
-                            ]
-                            merged_stats[feature]["mean"] = np.sum(weighted_means, axis=0).tolist()
-                        else:
-                            merged_stats[feature]["mean"] = np.mean(padded_means, axis=0).tolist()
-
-                    if "std" in merged_stats[feature] and all("std" in stat for stat in values):
-                        # Pad std values
-                        padded_stds = []
-                        for val in values:
-                            val_array = np.array(val["std"])
-                            val_flat = val_array.flatten()
-                            if len(val_flat) < max_dim:
-                                padded = np.zeros(max_dim)
-                                padded[: len(val_flat)] = val_flat
-                                padded_stds.append(padded)
-                            else:
-                                padded_stds.append(val_flat)
-
-                        if all("count" in stat for stat in values):
-                            counts = [stat["count"][0] for stat in values]
-                            total_count = sum(counts)
-                            variances = [std**2 for std in padded_stds]
-                            weighted_variances = [
-                                var * count / total_count
-                                for var, count in zip(variances, counts, strict=False)
-                            ]
-                            merged_stats[feature]["std"] = np.sqrt(
-                                np.sum(weighted_variances, axis=0)
-                            ).tolist()
-                        else:
-                            # Simple average of standard deviations
-                            merged_stats[feature]["std"] = np.mean(padded_stds, axis=0).tolist()
-
+        recalc_merged_stats_with_episode_stats(merged_stats, all_stats_data, target_dim=actual_max_dim)
+        if features_to_keep:
+            merged_stats = {k: v for k, v in merged_stats.items() if k in features_set or k in RESERVED_FEATURES}
         with open(os.path.join(output_folder, "meta", "stats.json"), "w") as f:
             json.dump(merged_stats, f, indent=4)
 
-    # Update and save info.json
-    info_path = os.path.join(source_folders[0], "meta", "info.json")
-    with open(info_path) as f:
-        info = json.load(f)
-
-    # Update info with correct counts
-    info["total_episodes"] = total_episodes
-    info["total_frames"] = total_frames
-    info["total_tasks"] = len(all_tasks)
-    info["total_chunks"] = (total_episodes + info["chunks_size"] - 1) // info[
-        "chunks_size"
-    ]  # Ceiling division
-
-    # Update splits
-    info["splits"] = {"train": f"0:{total_episodes}"}
-
-    # Update feature dimensions to the maximum dimension
-    if "features" in info:
-        # Find the maximum dimension across all folders
-        actual_max_dim = max_dim  # 使用变量替代硬编码的18
-        for _folder, dim in folder_dimensions.items():
-            actual_max_dim = max(actual_max_dim, dim)
-
-        # Update observation.state and action dimensions
-        for feature_name in ["observation.state", "action"]:
-            if feature_name in info["features"] and "shape" in info["features"][feature_name]:
-                info["features"][feature_name]["shape"] = [actual_max_dim]
-                print(f"Updated {feature_name} shape to {actual_max_dim}")
-
-    # 更新视频总数 (Update total videos)
-    info["total_videos"] = total_videos
-    print(f"更新视频总数为: {total_videos} (Update total videos to: {total_videos})")
+    base_info["total_episodes"] = total_episodes
+    # [FIX] 核心修复点 2: 删除了这里覆盖 total_frames 的代码
+    # base_info["total_frames"] = total_frames <-- 删除这行，保留上面的 total_frames_resampled
+    
+    base_info["total_tasks"] = len(filtered_tasks)
+    base_info["total_chunks"] = (total_episodes + chunks_size - 1) // chunks_size
+    base_info["splits"] = {"train": f"0:{total_episodes}"}
+    base_info["fps"] = fps
+    base_info["total_videos"] = total_videos
+    for feature_name in ["observation.state", "action"]:
+        if feature_name in base_info.get("features", {}) and "shape" in base_info["features"][feature_name]:
+            base_info["features"][feature_name]["shape"] = [actual_max_dim]
 
     with open(os.path.join(output_folder, "meta", "info.json"), "w") as f:
-        json.dump(info, f, indent=4)
+        json.dump(base_info, f, indent=4)
 
-    # Copy video and data files
-    copy_videos(source_folders, output_folder, episode_mapping, fps=fps)
+    if video_keys:
+        # [FIX] 传递 fps 参数给 copy_videos
+        copy_videos(source_folders, output_folder, episode_mapping, video_size=video_size, filtered_features=base_info["features"], fps=fps)
+    
     copy_data_files(
-        source_folders,
-        output_folder,
-        episode_mapping,
-        max_dim=max_dim,
+        source_folders=source_folders,
+        output_folder=output_folder,
+        episode_mapping=episode_mapping,
+        max_dim=actual_max_dim, 
         fps=fps,
-        episode_to_frame_index=episode_to_frame_index,
+        episode_to_frame_index=episode_to_frame_index, # [FIX] 传入更新后的映射表
         folder_task_mapping=folder_task_mapping,
+        folder_annotations_mapping=folder_annotations_mapping,
         chunks_size=chunks_size,
+        features_to_keep=features_to_keep,
+        remove_eef_flag=remove_eef,
+        features_def=base_info["features"],
+        folder_mapping_instructions=folder_mapping_instructions # [Fix] 传入映射指令
     )
-
-    print(f"Merged {total_episodes} episodes with {total_frames} frames into {output_folder}")
+    print(f"Done: {total_episodes} episodes, {total_frames_resampled} frames (resampled), output={output_folder}")
